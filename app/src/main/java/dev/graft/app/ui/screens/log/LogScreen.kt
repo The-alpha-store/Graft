@@ -205,14 +205,6 @@ private fun CommitRow(c: CommitInfo, graphRow: GraphRowLayout?, onClick: () -> U
 
 private val GRAPH_LANE_WIDTH = 18.dp
 
-/** Cycles through the app's existing 3-color accent system rather than introducing new hues —
- *  a lane's color has no persistent meaning across a repo's whole history anyway (lane 0 today
- *  isn't "the same branch" as lane 0 a hundred commits back once branches fork and merge), so
- *  what matters is that adjacent, currently-diverging lanes read as visually distinct, not
- *  that any specific color maps to any specific named branch. */
-private val LANE_PALETTE = listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.secondary, MaterialTheme.gitColors.added)
-private fun laneColor(lane: Int): Color = LANE_PALETTE[lane % LANE_PALETTE.size]
-
 /**
  * Draws this commit's lane dot, an incoming line from the row above (if one is expected to
  * continue into this same lane), and outgoing lines to each parent's lane at the bottom of
@@ -225,6 +217,11 @@ private fun laneColor(lane: Int): Color = LANE_PALETTE[lane % LANE_PALETTE.size]
  * lane, which is what makes a merge commit read correctly at a glance: the line forking off
  * to the side into another lane takes on that other lane's color rather than staying the
  * current row's color the whole way down.
+ *
+ * The lane palette is a cycle through the app's existing accent colors — a lane's color has
+ * no persistent meaning across a repo's whole history anyway (lane 0 today isn't "the same
+ * branch" as lane 0 a hundred commits back once branches fork and merge), so what matters is
+ * that adjacent, currently-diverging lanes read as visually distinct.
  */
 @Composable
 private fun CommitGraphLane(row: GraphRowLayout?, modifier: Modifier = Modifier) {
@@ -232,6 +229,17 @@ private fun CommitGraphLane(row: GraphRowLayout?, modifier: Modifier = Modifier)
         Box(modifier.width(GRAPH_LANE_WIDTH))
         return
     }
+
+    // MaterialTheme.* reads must happen during composition, so resolve the palette here
+    // (inside the @Composable body) and hand a plain List<Color> down to the DrawScope
+    // lambda, which is *not* a composable context.
+    val palette = listOf(
+        MaterialTheme.colorScheme.primary,
+        MaterialTheme.colorScheme.secondary,
+        MaterialTheme.gitColors.added,
+    )
+    fun laneColor(lane: Int): Color = palette[((lane % palette.size) + palette.size) % palette.size]
+
     val laneCount = row.laneCount.coerceAtLeast(1)
     val myColor = laneColor(row.lane)
     Canvas(modifier = modifier.width(GRAPH_LANE_WIDTH * laneCount)) {
