@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Both locations RepoStorage.apkDownloadsDir() can resolve to, and nothing else - a content://
+         grant handed to the system installer can't reach anything beyond a downloaded build.
+         PUBLIC mode: /storage/emulated/0/.Graft/apk-downloads/<repo>/ -->
+    <external-path name="apk_downloads_public" path=".Graft/apk-downloads/" />
+    <!-- APP mode (default): <app external files dir>/apk-downloads/<repo>/ -->
+    <external-files-path name="apk_downloads_app" path="apk-downloads/" />
+</paths>

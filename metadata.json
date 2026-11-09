@@ -1,0 +1,8 @@
+{
+  "name": "Graft",
+  "description": "Full-featured Git client for Android: clone/create repos, stage & commit, branches, tags, stash, conflict resolver, side-by-side diffs, file editor, GitHub Actions runs and workflow templates, APK install, and background sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Graft launcher glyph: a cyan trunk with two amber feature branches that merge back in.
+     Drawn inside the 66dp adaptive-icon safe zone (21..87 of the 108 viewport). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M50.5,29 C42,31 38,35 38,42 L38,56 C38,64 44,65 50.5,64.5"
+        android:strokeColor="#FFAB00"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M58.5,45 L63,45 C68,45 71,47.5 71,52 L71,60 C71,65 68,64.5 58.5,64"
+        android:strokeColor="#FFAB00"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M34,49 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 M67.4,52 a3.6,3.6 0 1,0 7.2,0 a3.6,3.6 0 1,0 -7.2,0 M67.4,60 a3.6,3.6 0 1,0 7.2,0 a3.6,3.6 0 1,0 -7.2,0"
+        android:strokeColor="#FFAB00"
+        android:strokeWidth="2.4" />
+    <path
+        android:pathData="M54,27 L54,81"
+        android:strokeColor="#00D4F0"
+        android:strokeWidth="2.8"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M49,27 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0 M49,45 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0 M49,64 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0"
+        android:strokeColor="#00D4F0"
+        android:strokeWidth="2.6" />
+    <path
+        android:pathData="M48,81 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0"
+        android:fillColor="#00D4F0" />
+</vector>

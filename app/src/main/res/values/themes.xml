@@ -1,0 +1,11 @@
+<resources>
+    <!-- Light variant. Compose paints everything once it's up; this theme only governs the window
+         before then (and the system bars' initial icon contrast). The night variant lives in
+         values-night so a dark-mode cold start isn't a white flash. -->
+    <style name="Theme.Graft" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

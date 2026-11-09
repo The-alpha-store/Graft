@@ -1,0 +1,113 @@
+name: Build
+
+# One workflow, two jobs, so a push shows up as a single run:
+#   * check   - unit tests + debug APK on every push / PR (fast feedback on compile errors)
+#   * release - signed release APK + GitHub Release, only for v* tags or a manual dispatch
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # AGP 9 needs Gradle 9.x and JDK 17+. Matches gradle/wrapper/gradle-wrapper.properties.
+  GRADLE_VERSION: "9.3.1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      # app/build.gradle.kts keeps the AI Studio signing configs untouched, and its debug config
+      # points at <root>/debug.keystore (git-ignored). Generate a throwaway one for CI.
+      - name: Create debug keystore
+        run: |
+          keytool -genkeypair -v -keystore debug.keystore \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Unit tests
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Assemble debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graft-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
+
+  release:
+    runs-on: ubuntu-latest
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      # The debug config is evaluated for every build, even a release one, so it needs its file too.
+      - name: Create debug keystore
+        run: |
+          keytool -genkeypair -v -keystore debug.keystore \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      # Secrets: KEYSTORE_B64 (base64 of the .jks/.p12), STORE_PASSWORD, KEY_PASSWORD. The key alias
+      # is fixed to "upload" by the signing config. For a PKCS12 keystore both passwords match.
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Set the KEYSTORE_B64, STORE_PASSWORD and KEY_PASSWORD repository secrets"
+            exit 1
+          fi
+          echo "::add-mask::$STORE_PASSWORD"
+          echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          test -s "$RUNNER_TEMP/release.keystore"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graft-release-apk
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
