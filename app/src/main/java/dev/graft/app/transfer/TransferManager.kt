@@ -61,8 +61,19 @@ class TransferManager(
      *  concurrency limit, per-repo ordering, cancellation - can be unit-tested without Android. */
     constructor(context: Context) : this(
         onStartService = {
-            runCatching {
+            // Delegating-constructor arguments run before `this` exists, so the call site
+            // must not touch `this` - including implicitly. A bare `runCatching { }` here
+            // resolves to the `T.runCatching` extension (T = TransferManager), which binds
+            // an uninitialised `this` and fails to compile. Explicit try/catch has the same
+            // behaviour (swallow the failure) without any receiver binding.
+            try {
                 ContextCompat.startForegroundService(context, Intent(context, TransferService::class.java))
+            } catch (e: Exception) {
+                // Service start not allowed right now (e.g. background start restrictions).
+                // Transfers still run; only the "stay alive in background" guarantee is lost.
+                // (Matches the old `runCatching { }` behaviour except it catches Exception
+                //  rather than Throwable - OutOfMemoryError etc. will now propagate, which
+                //  is what you want anyway.)
             }
         },
         onResultNotification = { task -> TransferNotifier.notifyResult(context, task) },

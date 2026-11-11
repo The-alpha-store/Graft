@@ -14,7 +14,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
 
 /**
@@ -41,9 +40,10 @@ class TransferService : Service() {
 
         if (observer == null) {
             observer = scope.launch {
-                // conflate + delay = at most ~2 notification updates a second; the system silently
-                // drops updates that come faster than that anyway.
-                manager.tasks.conflate().collect { tasks ->
+                // StateFlow is already conflated (latest value wins), so the delay below is all
+                // that's needed to cap updates at ~2/sec; the system silently drops faster ones
+                // anyway.
+                manager.tasks.collect { tasks ->
                     val now = tasks.filter { it.state.isActive }
                     if (now.isEmpty()) {
                         ServiceCompat.stopForeground(this@TransferService, ServiceCompat.STOP_FOREGROUND_REMOVE)
