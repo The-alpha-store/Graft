@@ -39,6 +39,12 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.graft.app.data.RepoStorage
+import dev.graft.app.transfer.statusLine
+import dev.graft.app.ui.components.TransferProgressBar
+import dev.graft.app.transfer.TransferTask
+import dev.graft.app.transfer.TransferState
+import dev.graft.app.transfer.TransferKind
+import dev.graft.app.App
 import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.ui.components.AppCard
 import dev.graft.app.ui.components.RefreshBox
@@ -57,9 +63,15 @@ fun RepoListScreen(
     onOpenCredentials: () -> Unit,
     onOpenDiscover: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenTransfers: () -> Unit = {},
     vm: RepoListViewModel = viewModel(),
 ) {
     val state by vm.uiState.collectAsState()
+    val appContext = LocalContext.current.applicationContext
+    val transferManager = remember { (appContext as App).transferManager }
+    val transfers by transferManager.tasks.collectAsState()
+    val activeTransfers = transfers.filter { it.state.isActive }
+    val activeClones = activeTransfers.filter { it.kind == TransferKind.CLONE }
     val snack = remember { SnackbarHostState() }
     var repoPendingDelete by remember { mutableStateOf<RepoEntity?>(null) }
     var repoPendingGitHubDelete by remember { mutableStateOf<RepoEntity?>(null) }
@@ -133,8 +145,18 @@ fun RepoListScreen(
                                     onClick = { showSortMenu = false; vm.setSortMode(RepoSortMode.HAS_CHANGES) })
                             }
                         }
-                        // Credentials and Settings are destinations (Home bottom bar / Settings),
-                        // so the bar only carries actions that act on *this* list.
+                        // Transfers history, with a badge while something is running.
+                        if (transfers.isNotEmpty()) {
+                            IconButton(onClick = onOpenTransfers) {
+                                if (activeTransfers.isNotEmpty()) {
+                                    BadgedBox(badge = { Badge { Text(activeTransfers.size.toString()) } }) {
+                                        Icon(Icons.Filled.Download, "Transfers")
+                                    }
+                                } else {
+                                    Icon(Icons.Filled.Download, "Transfers")
+                                }
+                            }
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface, titleContentColor = MaterialTheme.colorScheme.onSurface, navigationIconContentColor = MaterialTheme.colorScheme.onSurface, actionIconContentColor = MaterialTheme.colorScheme.onSurface),
@@ -179,9 +201,9 @@ fun RepoListScreen(
                 onRefresh = vm::refresh,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             ) {
-                if (state.repos.isEmpty()) {
+                if (state.repos.isEmpty() && activeClones.isEmpty()) {
                     HomeEmptyState(onAddRepo = { showCloneSheet = true }, onDiscover = onOpenDiscover)
-                } else if (visibleRepos.isEmpty()) {
+                } else if (visibleRepos.isEmpty() && activeClones.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text("No repos match \"${state.searchQuery}\"", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -191,7 +213,10 @@ fun RepoListScreen(
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        item(key = "summary") {
+                        items(activeClones, key = { "clone-${it.id}" }) { task ->
+                            CloneProgressCard(task = task, onCancel = { transferManager.cancel(task.id) })
+                        }
+                        if (state.repos.isNotEmpty()) item(key = "summary") {
                             val needAttention = state.repos.count { r ->
                                 r.lastError.isNotBlank() || (state.changeCounts[r.id] ?: 0) > 0
                             }
@@ -200,6 +225,8 @@ fun RepoListScreen(
                         items(visibleRepos, key = { it.id }) { repo ->
                             RepoCard(
                                 repo = repo, isBusy = state.busyRepoId == repo.id,
+                                transfer = activeTransfers.firstOrNull { it.repoId == repo.id },
+                                onCancelTransfer = { activeTransfers.firstOrNull { it.repoId == repo.id }?.let { transferManager.cancel(it.id) } },
                                 changeCount = state.changeCounts[repo.id],
                                 onTap = { onOpenRepo(repo.id) },
                                 onLongPress = { repoPendingDelete = repo },
@@ -474,6 +501,7 @@ private fun HomeSummary(total: Int, needAttention: Int) {
 @Composable
 private fun RepoCard(
     repo: RepoEntity, isBusy: Boolean, changeCount: Int?,
+    transfer: TransferTask?, onCancelTransfer: () -> Unit,
     onTap: () -> Unit, onLongPress: () -> Unit,
     onPull: () -> Unit, onPush: () -> Unit,
     onFetch: () -> Unit, onRequestPullForce: () -> Unit, onRequestPushForce: () -> Unit,
@@ -576,22 +604,68 @@ private fun RepoCard(
             }
 
             Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedButton(onClick = onPull, enabled = !isBusy, modifier = Modifier.weight(1f)) {
-                    if (isBusy) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-                    else { Icon(Icons.Filled.ArrowDownward, null, Modifier.size(14.dp)); Spacer(Modifier.width(4.dp)); Text("Pull") }
+            if (transfer != null) {
+                TransferProgressBlock(transfer, onCancelTransfer)
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(onClick = onPull, enabled = !isBusy, modifier = Modifier.weight(1f)) {
+                        if (isBusy) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                        else { Icon(Icons.Filled.ArrowDownward, null, Modifier.size(14.dp)); Spacer(Modifier.width(4.dp)); Text("Pull") }
+                    }
+                    Button(
+                        onClick = onPush, enabled = !isBusy, modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.secondary,
+                            contentColor = MaterialTheme.colorScheme.onSecondary,
+                        ),
+                    ) {
+                        if (isBusy) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onSecondary)
+                        else { Icon(Icons.Filled.ArrowUpward, null, Modifier.size(14.dp)); Spacer(Modifier.width(4.dp)); Text("Push") }
+                    }
                 }
-                Button(
-                    onClick = onPush, enabled = !isBusy, modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.secondary,
-                        contentColor = MaterialTheme.colorScheme.onSecondary,
-                    ),
-                ) {
-                    if (isBusy) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onSecondary)
-                    else { Icon(Icons.Filled.ArrowUpward, null, Modifier.size(14.dp)); Spacer(Modifier.width(4.dp)); Text("Push") }
-                }
+
             }
+        }
+    }
+}
+
+/** Replaces a card's Pull/Push buttons while that repo has a transfer running. */
+@Composable
+private fun TransferProgressBlock(task: TransferTask, onCancel: () -> Unit) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "${task.kind.doing}… ${task.statusLine()}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (!task.indeterminate && task.state == TransferState.RUNNING) {
+                Text("${(task.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge)
+            }
+            TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                Text("Cancel")
+            }
+        }
+        TransferProgressBar(task, Modifier.fillMaxWidth())
+    }
+}
+
+/** A repo that's still downloading: shown in the list like Chrome shows a file mid-download. */
+@Composable
+private fun CloneProgressCard(task: TransferTask, onCancel: () -> Unit) {
+    AppCard(Modifier.fillMaxWidth(), accent = MaterialTheme.colorScheme.primary) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Download, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(10.dp))
+                Text(task.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.weight(1f))
+                StatusPill("Cloning", MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.primaryContainer)
+            }
+            Spacer(Modifier.height(8.dp))
+            TransferProgressBlock(task, onCancel)
         }
     }
 }

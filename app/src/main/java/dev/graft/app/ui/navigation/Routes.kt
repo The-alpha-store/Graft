@@ -33,6 +33,7 @@ object Routes {
     // ---- Standalone (no repo) ----
     const val CREDENTIALS = "credentials"
     const val APK_DOWNLOADS = "apk_downloads"
+    const val TRANSFERS = "transfers"
 
     // ---- Repo scope: the graph and its tabs ----
     const val REPO_GRAPH = "repo/{repoId}"

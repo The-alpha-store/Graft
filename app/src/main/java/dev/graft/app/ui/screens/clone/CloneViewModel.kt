@@ -10,6 +10,7 @@ import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.data.repository.DecryptedCredential
 import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitResult
+import dev.graft.app.transfer.TransferKind
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,6 +23,8 @@ enum class AddRepoMode { CLONE, CREATE }
 data class CloneUiState(
     val mode: AddRepoMode = AddRepoMode.CLONE,
     val createInitialCommit: Boolean = true,
+    /** Fetch only the latest commit - far less to download, no history. */
+    val shallow: Boolean = false,
     /** Latest JGit phase while cloning ("Receiving objects"...). Null when idle. */
     val progress: String? = null,
     val url: String = "",
@@ -52,6 +55,10 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onModeChanged(mode: AddRepoMode) {
         _uiState.update { it.copy(mode = mode, errorMessage = null) }
+    }
+
+    fun onShallowChanged(enabled: Boolean) {
+        _uiState.update { it.copy(shallow = enabled) }
     }
 
     fun onInitialCommitChanged(enabled: Boolean) {
@@ -102,51 +109,63 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val destination = File(dev.graft.app.data.RepoStorage.reposRootDir(context), name)
+        val alreadyCloning = app.transferManager.tasks.value.any {
+            it.kind == TransferKind.CLONE && it.title == name && it.state.isActive
+        }
+        if (destination.exists() || alreadyCloning) {
+            _uiState.value = state.copy(
+                errorMessage = if (alreadyCloning) "\"$name\" is already being cloned."
+                else "A folder named \"$name\" already exists. Pick a different name.",
+            )
+            return
+        }
+
+        val url = state.url.trim()
+        val branch = state.branch.trim()
+        val shallow = state.shallow
+        val credentialId = state.selectedCredentialId
+
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isCloning = true, errorMessage = null, progress = "Connecting…")
+            val credential = credentialId?.let { credentialRepository.getById(it) }
 
-            val reposDir = dev.graft.app.data.RepoStorage.reposRootDir(context)
-            val destination = File(reposDir, name)
-
-            if (destination.exists()) {
-                _uiState.value = _uiState.value.copy(
-                    isCloning = false,
-                    errorMessage = "A folder named \"$name\" already exists. Pick a different name."
-                )
-                return@launch
-            }
-
-            val credential = state.selectedCredentialId?.let { credentialRepository.getById(it) }
-
-            when (val result = GitEngine.cloneRepo(
-                url = state.url,
-                localPath = destination.absolutePath,
-                branch = state.branch,
-                credential = credential,
-                onProgress = { phase -> _uiState.update { it.copy(progress = phase) } },
-            )) {
-                is GitResult.Success -> {
-                    result.data.close()
-                    repoRepository.addRepo(
-                        RepoEntity(
-                            name = name,
-                            fullSavePath = destination.absolutePath,
-                            cloneUrl = state.url,
-                            branch = state.branch,
-                            credentialId = state.selectedCredentialId ?: 0L
+            // Hand the clone to the transfer manager and close the sheet straight away: the download
+            // continues in the background (with a progress row, banner and notification), and the
+            // repo appears in the list the moment it's done.
+            app.transferManager.enqueue(
+                kind = TransferKind.CLONE,
+                repoId = 0L,
+                title = name,
+                watchDir = destination,
+                announce = true,
+                cleanup = { destination.deleteRecursively() },
+            ) { reporter ->
+                when (val result = GitEngine.cloneRepo(
+                    url = url,
+                    localPath = destination.absolutePath,
+                    branch = branch,
+                    shallow = shallow,
+                    credential = credential,
+                    monitor = reporter.monitor,
+                )) {
+                    is GitResult.Success -> {
+                        result.data.close()
+                        val id = repoRepository.addRepo(
+                            RepoEntity(
+                                name = name,
+                                fullSavePath = destination.absolutePath,
+                                cloneUrl = url,
+                                branch = branch,
+                                credentialId = credentialId ?: 0L,
+                            ),
                         )
-                    )
-                    _uiState.value = _uiState.value.copy(isCloning = false, progress = null, done = true)
-                }
-                is GitResult.Error -> {
-                    destination.deleteRecursively()
-                    _uiState.value = _uiState.value.copy(
-                        isCloning = false,
-                        progress = null,
-                        errorMessage = result.message
-                    )
+                        reporter.setOpenRepoId(id)
+                        GitResult.Success("Cloned $name")
+                    }
+                    is GitResult.Error -> result
                 }
             }
+            _uiState.value = _uiState.value.copy(done = true)
         }
     }
 

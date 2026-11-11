@@ -5,6 +5,7 @@ import dev.graft.app.ui.theme.gitColors
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -40,6 +41,7 @@ import dev.graft.app.git.FileNode
 import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitFileStatus
 import dev.graft.app.git.GitResult
+import dev.graft.app.transfer.awaitResult
 import dev.graft.app.ui.components.RepoTitleBlock
 import dev.graft.app.ui.components.ConfirmDialog
 import dev.graft.app.ui.components.SingleInputDialog
@@ -76,6 +78,10 @@ data class ExplorerUiState(
     val isLoading: Boolean = true,
     val isBusy: Boolean = false,
     val message: String? = null,
+    /** "Find file by name" - searches the whole repo, not just expanded folders. */
+    val filterQuery: String = "",
+    val filterResults: List<FileNode> = emptyList(),
+    val isFiltering: Boolean = false,
 )
 
 class FileExplorerViewModel(app: Application) : AndroidViewModel(app) {
@@ -85,6 +91,52 @@ class FileExplorerViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _uiState = MutableStateFlow(ExplorerUiState())
     val uiState: StateFlow<ExplorerUiState> = _uiState.asStateFlow()
+
+    private var filterJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Debounced whole-repo filename search. Walks the working tree lazily (skipping `.git`, and
+     * dot-folders unless hidden files are shown) and stops at [MAX_FILTER_RESULTS], so even a huge
+     * repo answers quickly and never builds a giant list.
+     */
+    fun setFilter(query: String) {
+        _uiState.value = _uiState.value.copy(filterQuery = query)
+        filterJob?.cancel()
+        val repo = _uiState.value.repo
+        if (query.isBlank() || repo == null) {
+            _uiState.value = _uiState.value.copy(filterResults = emptyList(), isFiltering = false)
+            return
+        }
+        filterJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(180)
+            _uiState.value = _uiState.value.copy(isFiltering = true)
+            val root = File(repo.fullSavePath)
+            val needle = query.trim().lowercase()
+            val showHidden = _uiState.value.showHiddenFiles
+            val results = withContext(Dispatchers.IO) {
+                root.walkTopDown()
+                    .onEnter { dir -> dir == root || (dir.name != ".git" && (showHidden || !dir.name.startsWith("."))) }
+                    .filter { it.isFile && it.name.lowercase().contains(needle) }
+                    .take(MAX_FILTER_RESULTS)
+                    .map { f ->
+                        FileNode(
+                            name = f.name,
+                            relativePath = f.relativeTo(root).invariantSeparatorsPath,
+                            isDirectory = false,
+                            sizeBytes = f.length(),
+                        )
+                    }
+                    .toList()
+            }
+            if (_uiState.value.filterQuery == query) {
+                _uiState.value = _uiState.value.copy(filterResults = results, isFiltering = false)
+            }
+        }
+    }
+
+    private companion object {
+        const val MAX_FILTER_RESULTS = 300
+    }
 
     /** [revealPath] (optional) auto-expands the ancestor chain of a specific file so it's
      *  visible on first load — used by the `graft://repo/{id}` deep link. Best-effort:
@@ -522,21 +574,24 @@ class FileExplorerViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isBusy = true)
             val credential = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
-            when (val openResult = GitEngine.openRepo(repo.fullSavePath)) {
-                is GitResult.Error -> _uiState.value = _uiState.value.copy(isBusy = false, message = openResult.message)
+            val manager = getApplication<dev.graft.app.App>().transferManager
+            // A background transfer: visible in the Transfers list, survives leaving this screen.
+            val outcome = manager.enqueue(
+                kind = dev.graft.app.transfer.TransferKind.PUSH, repoId = repo.id,
+                title = repo.name, watchDir = java.io.File(repo.fullSavePath),
+            ) { reporter ->
+                manager.withGit(repo.fullSavePath) { git ->
+                    GitEngine.push(git, credential = credential, monitor = reporter.monitor)
+                }
+            }.awaitResult()
+            when (outcome) {
+                is GitResult.Error -> {
+                    repoRepo.markError(repo.id, outcome.message)
+                    _uiState.value = _uiState.value.copy(isBusy = false, message = outcome.message)
+                }
                 is GitResult.Success -> {
-                    val git = openResult.data
-                    when (val result = GitEngine.push(git, credential = credential)) {
-                        is GitResult.Error -> {
-                            repoRepo.markError(repo.id, result.message)
-                            _uiState.value = _uiState.value.copy(isBusy = false, message = result.message)
-                        }
-                        is GitResult.Success -> {
-                            repoRepo.markSyncSuccess(repo.id)
-                            _uiState.value = _uiState.value.copy(isBusy = false, message = "Pushed")
-                        }
-                    }
-                    git.close()
+                    repoRepo.markSyncSuccess(repo.id)
+                    _uiState.value = _uiState.value.copy(isBusy = false, message = "Pushed")
                 }
             }
         }
@@ -575,6 +630,11 @@ fun FileExplorerScreen(
     var showBulkDeleteConfirm by remember { mutableStateOf(false) }
     var fabExpanded by remember { mutableStateOf(false) }
     var showOverflowMenu by remember { mutableStateOf(false) }
+    var showFilter by remember { mutableStateOf(false) }
+    var nodeForProperties by remember { mutableStateOf<FileNode?>(null) }
+    BackHandler(enabled = showFilter) { showFilter = false; vm.setFilter("") }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val copyScope = androidx.compose.runtime.rememberCoroutineScope()
     val selectionMode = selectedPaths.isNotEmpty()
 
     val importFilesLauncher = rememberLauncherForActivityResult(
@@ -648,6 +708,11 @@ fun FileExplorerScreen(
                                 SortModeItem("Sort by date", ExplorerSortMode.DATE, state.sortMode) { vm.setSortMode(it); showOverflowMenu = false }
                                 HorizontalDivider()
                                 DropdownMenuItem(
+                                    text = { Text("Find file by name") },
+                                    leadingIcon = { Icon(Icons.Filled.Search, null) },
+                                    onClick = { showOverflowMenu = false; showFilter = true },
+                                )
+                                DropdownMenuItem(
                                     text = { Text("Collapse all") },
                                     leadingIcon = { Icon(Icons.Filled.UnfoldLess, null) },
                                     onClick = { vm.collapseAll(); showOverflowMenu = false },
@@ -680,6 +745,15 @@ fun FileExplorerScreen(
             },
         ) {
             when {
+                showFilter -> FileFilterPanel(
+                    query = state.filterQuery,
+                    results = state.filterResults,
+                    isFiltering = state.isFiltering,
+                    onQueryChange = vm::setFilter,
+                    onOpen = { node -> onOpenFile(node.relativePath) },
+                    onClose = { showFilter = false; vm.setFilter("") },
+                    modifier = Modifier.fillMaxSize().padding(pad),
+                )
                 state.isLoading -> Box(Modifier.fillMaxSize().padding(pad), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 state.visibleRows.isEmpty() -> Box(Modifier.fillMaxSize().padding(pad), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -711,6 +785,11 @@ fun FileExplorerScreen(
                             onRename = { nodePendingRename = row.node },
                             onDelete = { nodePendingDelete = row.node },
                             onBlame = { onOpenBlame(row.node.relativePath) },
+                            onCopyPath = {
+                                clipboard.setText(androidx.compose.ui.text.AnnotatedString(row.node.relativePath))
+                                copyScope.launch { snack.showSnackbar("Copied ${row.node.relativePath}") }
+                            },
+                            onProperties = { nodeForProperties = row.node },
                             onNewFileHere = { createTargetPath = row.node.relativePath; showNewFileDialog = true },
                             onNewFolderHere = { createTargetPath = row.node.relativePath; showNewFolderDialog = true },
                             onImportFilesHere = { createTargetPath = row.node.relativePath; importFilesLauncher.launch(arrayOf("*/*")) },
@@ -731,6 +810,17 @@ fun FileExplorerScreen(
             onDismiss = { showBulkDeleteConfirm = false },
             onConfirm = { vm.bulkDelete(selectedNodes); showBulkDeleteConfirm = false; selectedPaths = emptySet() },
         )
+    }
+
+    nodeForProperties?.let { node ->
+        state.repo?.let { repo ->
+            PropertiesDialog(
+                repoRoot = File(repo.fullSavePath),
+                node = node,
+                gitStatus = state.gitStatusByPath[node.relativePath],
+                onDismiss = { nodeForProperties = null },
+            )
+        }
     }
 
     if (showNewFileDialog) {
@@ -789,6 +879,8 @@ private fun TreeRowItem(
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onBlame: () -> Unit,
+    onCopyPath: () -> Unit,
+    onProperties: () -> Unit,
     onNewFileHere: () -> Unit,
     onNewFolderHere: () -> Unit,
     onImportFilesHere: () -> Unit,
@@ -901,6 +993,11 @@ private fun TreeRowItem(
                         DropdownMenuItem(text = { Text("Blame") }, onClick = { showMenu = false; onBlame() },
                             leadingIcon = { Icon(Icons.Filled.History, null) })
                     }
+                    DropdownMenuItem(text = { Text("Copy path") }, onClick = { showMenu = false; onCopyPath() },
+                        leadingIcon = { Icon(Icons.Filled.ContentCopy, null) })
+                    DropdownMenuItem(text = { Text("Properties") }, onClick = { showMenu = false; onProperties() },
+                        leadingIcon = { Icon(Icons.Filled.Info, null) })
+                    HorizontalDivider()
                     DropdownMenuItem(text = { Text("Delete") }, onClick = { showMenu = false; onDelete() },
                         leadingIcon = { Icon(Icons.Filled.Delete, null, tint = MaterialTheme.colorScheme.error) })
                 }

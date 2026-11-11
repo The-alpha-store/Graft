@@ -82,6 +82,29 @@ slip in the files rewritten for this merge (`ui/theme`, `ui/components`, `ui/nav
 `screens/overview`, `screens/actions/WorkflowTemplatesTab.kt`, `screens/diff/SideBySideDiff.kt`,
 edits to `RepoListScreen`, `SettingsScreen`, `CloneScreen`/`CloneViewModel`).
 
+## Round 2: transfers, speed, Files tab
+
+- **New `transfer/` package**: `TransferManager` (app-scoped, 2-at-a-time, per-repo lock),
+  `TransferService` (foreground, `dataSync`), `TransferNotifier`, pure `PhaseProgress`/`RateTracker`.
+  Callers rerouted: Clone sheet, Discover, Home cards, Changes (fetch/pull/push/sync and the
+  commit-and-push shortcut), Files-tab push, editor "save, commit & push". Console, tag/branch push
+  and the sync worker keep their direct calls on purpose.
+- **Engine**: progress monitor + 45 s timeout on every remote call; single-pass `stageAll`; batched
+  `unstageFiles`; `TagOpt.NO_TAGS` for background fetch (a new tag is not "new commits").
+- **Self-contained handles**: each transfer opens and closes its own `Git`, so it can't depend on a
+  ViewModel's handle surviving (a push used to be silently abandoned if you left the screen).
+- **Files tab**: filename search, properties, copy path, find & replace. The base's tree is *not*
+  ported - the reference explorer already had a superset (multi-select, import, compact folders, sort).
+
+### Known limits
+
+- Nothing here has been run or benchmarked; speed claims are from removing redundant work, not stopwatch
+  numbers. Measure a clone/commit before and after if it matters to you.
+- Cancel is cooperative: JGit checks between objects, so there can be a moment before it stops, and
+  during the very first server negotiation it may only stop at the 45 s inactivity timeout.
+- Bytes/speed are inferred from pack-file growth, so they're approximate; a push has no byte figure.
+- Android 15 limits `dataSync` foreground services to ~6 h per day - irrelevant for git, noted anyway.
+
 ## Behavior changes to know about
 
 - The Room database file is `graft.db` with a new `sync_logs` table (v2). Repos you added in

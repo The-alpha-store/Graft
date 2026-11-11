@@ -27,6 +27,7 @@ import dev.graft.app.App
 import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitResult
+import dev.graft.app.transfer.awaitResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -53,6 +54,7 @@ data class EditorUiState(
     val findQuery: String = "",
     val findMatches: List<IntRange> = emptyList(),
     val findMatchIndex: Int = -1,
+    val findMatchCase: Boolean = false,
 )
 
 class FileEditorViewModel(app: Application) : AndroidViewModel(app) {
@@ -221,18 +223,27 @@ class FileEditorViewModel(app: Application) : AndroidViewModel(app) {
                         return@launch
                     }
 
+                    git.close() // the push below opens its own handle
                     val credential = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
-                    when (val pushResult = GitEngine.push(git, credential = credential)) {
+                    val manager = appRef.transferManager
+                    val pushOutcome = manager.enqueue(
+                        kind = dev.graft.app.transfer.TransferKind.PUSH, repoId = repo.id,
+                        title = repo.name, watchDir = File(repo.fullSavePath),
+                    ) { reporter ->
+                        manager.withGit(repo.fullSavePath) { pg ->
+                            GitEngine.push(pg, credential = credential, monitor = reporter.monitor)
+                        }
+                    }.awaitResult()
+                    when (pushOutcome) {
                         is GitResult.Error -> {
-                            repoRepo.markError(repo.id, pushResult.message)
-                            _uiState.value = _uiState.value.copy(isSaving = false, isDirty = false, message = "Committed, but push failed: ${pushResult.message}")
+                            repoRepo.markError(repo.id, pushOutcome.message)
+                            _uiState.value = _uiState.value.copy(isSaving = false, isDirty = false, message = "Committed, but push failed: ${pushOutcome.message}")
                         }
                         is GitResult.Success -> {
                             repoRepo.markSyncSuccess(repo.id)
                             _uiState.value = _uiState.value.copy(isSaving = false, isDirty = false, message = "Saved, committed, and pushed")
                         }
                     }
-                    git.close()
                 }
             }
         }
@@ -242,15 +253,68 @@ class FileEditorViewModel(app: Application) : AndroidViewModel(app) {
      *  this" by scanning every file on disk. This only ever looks inside the buffer already
      *  open here, and (unlike repo-wide search) updates live as the text underneath it changes. */
     fun setFindQuery(query: String) {
-        val text = _uiState.value.text.text
-        val matches = if (query.isBlank()) emptyList() else buildList {
-            var idx = text.indexOf(query, 0, ignoreCase = true)
+        val matches = computeMatches(_uiState.value.text.text, query, _uiState.value.findMatchCase)
+        _uiState.value = _uiState.value.copy(findQuery = query, findMatches = matches, findMatchIndex = if (matches.isEmpty()) -1 else 0)
+    }
+
+    private fun computeMatches(text: String, query: String, matchCase: Boolean): List<IntRange> {
+        if (query.isEmpty()) return emptyList()
+        return buildList {
+            var idx = text.indexOf(query, 0, ignoreCase = !matchCase)
             while (idx >= 0) {
                 add(idx until (idx + query.length))
-                idx = text.indexOf(query, idx + 1, ignoreCase = true)
+                idx = text.indexOf(query, idx + query.length, ignoreCase = !matchCase)
             }
         }
-        _uiState.value = _uiState.value.copy(findQuery = query, findMatches = matches, findMatchIndex = if (matches.isEmpty()) -1 else 0)
+    }
+
+    fun toggleFindMatchCase() {
+        val s = _uiState.value
+        val matchCase = !s.findMatchCase
+        val matches = computeMatches(s.text.text, s.findQuery, matchCase)
+        _uiState.value = s.copy(
+            findMatchCase = matchCase, findMatches = matches,
+            findMatchIndex = if (matches.isEmpty()) -1 else 0,
+        )
+    }
+
+    /** One undoable step: a find/replace is a single edit to the user, however many spots it touches. */
+    private fun commitDiscreteEdit(newValue: TextFieldValue) {
+        undoStack.addLast(_uiState.value.text)
+        if (undoStack.size > maxHistory) undoStack.removeFirst()
+        redoStack.clear()
+        lastEditAtMs = 0L
+        _uiState.value = _uiState.value.copy(text = newValue, isDirty = true, canUndo = true, canRedo = false)
+    }
+
+    /** Replaces the match the cursor is on, then lands on the next one. */
+    fun replaceCurrent(replacement: String) {
+        val s = _uiState.value
+        val match = s.findMatches.getOrNull(s.findMatchIndex) ?: return
+        val text = s.text.text
+        val newText = text.substring(0, match.first) + replacement + text.substring(match.last + 1)
+        val cursor = match.first + replacement.length
+        commitDiscreteEdit(TextFieldValue(newText, TextRange(cursor, cursor)))
+        val matches = computeMatches(newText, s.findQuery, s.findMatchCase)
+        _uiState.value = _uiState.value.copy(
+            findMatches = matches,
+            findMatchIndex = if (matches.isEmpty()) -1 else s.findMatchIndex.coerceAtMost(matches.size - 1),
+        )
+    }
+
+    /** Replaces every match in one go (and one undo step). */
+    fun replaceAll(replacement: String) {
+        val s = _uiState.value
+        if (s.findQuery.isEmpty() || s.findMatches.isEmpty()) return
+        val count = s.findMatches.size
+        val newText = s.text.text.replace(s.findQuery, replacement, ignoreCase = !s.findMatchCase)
+        commitDiscreteEdit(TextFieldValue(newText, TextRange(0, 0)))
+        val matches = computeMatches(newText, s.findQuery, s.findMatchCase)
+        _uiState.value = _uiState.value.copy(
+            findMatches = matches,
+            findMatchIndex = if (matches.isEmpty()) -1 else 0,
+            message = "Replaced $count occurrence${if (count == 1) "" else "s"}",
+        )
     }
 
     fun findNext() {
@@ -416,6 +480,10 @@ fun FileEditorScreen(
                         matchCount = state.findMatches.size,
                         matchIndex = state.findMatchIndex,
                         onQueryChange = vm::setFindQuery,
+                        matchCase = state.findMatchCase,
+                        onToggleMatchCase = vm::toggleFindMatchCase,
+                        onReplace = vm::replaceCurrent,
+                        onReplaceAll = vm::replaceAll,
                         onNext = vm::findNext,
                         onPrevious = vm::findPrevious,
                         onClose = { showFind = false; vm.closeFind() },
@@ -522,34 +590,59 @@ fun FileEditorScreen(
 @Composable
 private fun FindBar(
     query: String, matchCount: Int, matchIndex: Int,
-    onQueryChange: (String) -> Unit, onNext: () -> Unit, onPrevious: () -> Unit, onClose: () -> Unit,
+    onQueryChange: (String) -> Unit,
+    matchCase: Boolean, onToggleMatchCase: () -> Unit,
+    onReplace: (String) -> Unit, onReplaceAll: (String) -> Unit,
+    onNext: () -> Unit, onPrevious: () -> Unit, onClose: () -> Unit,
 ) {
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    var replaceOpen by remember { mutableStateOf(false) }
+    var replacement by remember { mutableStateOf("") }
 
     Surface(tonalElevation = 3.dp) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-        ) {
-            OutlinedTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                modifier = Modifier.weight(1f).focusRequester(focusRequester),
-                placeholder = { Text("Find in file") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Next),
-                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onNext = { onNext() }),
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                if (query.isBlank()) "" else if (matchCount == 0) "0/0" else "${matchIndex + 1}/$matchCount",
-                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.widthIn(min = 36.dp),
-            )
-            IconButton(onClick = onPrevious, enabled = matchCount > 0) { Icon(Icons.Filled.KeyboardArrowUp, "Previous match") }
-            IconButton(onClick = onNext, enabled = matchCount > 0) { Icon(Icons.Filled.KeyboardArrowDown, "Next match") }
-            IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close find") }
+        Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = onQueryChange,
+                    modifier = Modifier.weight(1f).focusRequester(focusRequester),
+                    placeholder = { Text("Find in file") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Next),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onNext = { onNext() }),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    if (query.isBlank()) "" else if (matchCount == 0) "0/0" else "${matchIndex + 1}/$matchCount",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.widthIn(min = 36.dp),
+                )
+                IconButton(onClick = onPrevious, enabled = matchCount > 0) { Icon(Icons.Filled.KeyboardArrowUp, "Previous match") }
+                IconButton(onClick = onNext, enabled = matchCount > 0) { Icon(Icons.Filled.KeyboardArrowDown, "Next match") }
+                IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close find") }
+            }
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                FilterChip(selected = matchCase, onClick = onToggleMatchCase, label = { Text("Aa") })
+                Spacer(Modifier.width(8.dp))
+                TextButton(onClick = { replaceOpen = !replaceOpen }) {
+                    Text(if (replaceOpen) "Hide replace" else "Replace…")
+                }
+            }
+            if (replaceOpen) {
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = replacement,
+                        onValueChange = { replacement = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("Replace with") },
+                        singleLine = true,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    TextButton(onClick = { onReplace(replacement) }, enabled = matchCount > 0) { Text("Replace") }
+                    TextButton(onClick = { onReplaceAll(replacement) }, enabled = matchCount > 0) { Text("All") }
+                }
+            }
         }
     }
 }

@@ -12,6 +12,7 @@ import dev.graft.app.data.github.GitHubResult
 import dev.graft.app.data.repository.DecryptedCredential
 import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitResult
+import dev.graft.app.transfer.TransferKind
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -184,41 +185,55 @@ class DiscoverViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Shared by both cloneRepo and createRepo: clones [repo] into the public repos folder
-     *  and registers it, returning a user-facing status message either way. */
-    private suspend fun cloneAndTrack(
+    /** Shared by both cloneRepo and createRepo: queues a background clone of [repo] into the repos
+     *  folder (registering it when done) and returns the status message to show right away. */
+    private fun cloneAndTrack(
         repo: GitHubRepoSummary, credential: DecryptedCredential?, credentialId: Long,
     ): String {
+        val app = getApplication<App>()
         val name = repo.fullName.substringAfterLast("/")
-        val destination = File(RepoStorage.reposRootDir(getApplication<App>()), name)
+        val destination = File(RepoStorage.reposRootDir(app), name)
+        val alreadyCloning = app.transferManager.tasks.value.any {
+            it.kind == TransferKind.CLONE && it.title == name && it.state.isActive
+        }
+        if (alreadyCloning) return "\"$name\" is already being cloned."
         if (destination.exists()) {
-            return "Created on GitHub, but a local folder named \"$name\" already exists — rename or remove it, then clone from Discover."
+            return "A local folder named \"$name\" already exists — rename or remove it, then clone from Discover."
         }
 
-        return when (val result = GitEngine.cloneRepo(
-            url = repo.cloneUrl,
-            localPath = destination.absolutePath,
-            branch = repo.defaultBranch,
-            credential = credential,
-        )) {
-            is GitResult.Success -> {
-                result.data.close()
-                repoRepo.addRepo(
-                    RepoEntity(
-                        name = name,
-                        fullSavePath = destination.absolutePath,
-                        cloneUrl = repo.cloneUrl,
-                        branch = repo.defaultBranch,
-                        credentialId = credentialId,
-                    ),
-                )
-                "Cloned $name"
-            }
-            is GitResult.Error -> {
-                destination.deleteRecursively()
-                result.message
+        app.transferManager.enqueue(
+            kind = TransferKind.CLONE,
+            repoId = 0L,
+            title = name,
+            watchDir = destination,
+            announce = true,
+            cleanup = { destination.deleteRecursively() },
+        ) { reporter ->
+            when (val result = GitEngine.cloneRepo(
+                url = repo.cloneUrl,
+                localPath = destination.absolutePath,
+                branch = repo.defaultBranch,
+                credential = credential,
+                monitor = reporter.monitor,
+            )) {
+                is GitResult.Success -> {
+                    result.data.close()
+                    val id = repoRepo.addRepo(
+                        RepoEntity(
+                            name = name,
+                            fullSavePath = destination.absolutePath,
+                            cloneUrl = repo.cloneUrl,
+                            branch = repo.defaultBranch,
+                            credentialId = credentialId,
+                        ),
+                    )
+                    reporter.setOpenRepoId(id)
+                    GitResult.Success("Cloned $name")
+                }
+                is GitResult.Error -> result
             }
         }
+        return "Cloning $name in the background…"
     }
 
     fun dismissMessage() { _state.value = _state.value.copy(message = null) }

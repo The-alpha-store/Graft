@@ -5,6 +5,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.graft.app.App
 import dev.graft.app.data.RepoStatusStore
+import org.eclipse.jgit.lib.ProgressMonitor
+import dev.graft.app.transfer.awaitResult
+import dev.graft.app.transfer.TransferKind
 import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.data.github.GitHubApi
 import dev.graft.app.data.github.GitHubResult
@@ -14,6 +17,12 @@ import dev.graft.app.git.GitResult
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.io.File
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.async
+import java.util.concurrent.ConcurrentHashMap
 
 enum class RepoSortMode { RECENT, NAME, HAS_CHANGES }
 
@@ -95,21 +104,42 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
     fun setSearchQuery(q: String) { searchQuery.value = q }
     fun setSortMode(m: RepoSortMode) { sortMode.value = m }
 
+    /** At most this many repos are scanned at once - each scan walks a whole working tree. */
+    private val statusLimit = Semaphore(3)
+    private val inFlight = ConcurrentHashMap.newKeySet<Long>()
+
     private fun loadChangeCount(repo: RepoEntity) {
-        viewModelScope.launch {
-            when (val opened = GitEngine.openRepo(repo.fullSavePath)) {
-                is GitResult.Error -> Unit // leave uncomputed rather than showing a false "0"
-                is GitResult.Success -> {
-                    val git = opened.data
-                    val statusResult = GitEngine.getStatus(git)
-                    if (statusResult is GitResult.Success) {
-                        val count = statusResult.data.map { it.path }.distinct().size
-                        changeCounts.value = changeCounts.value + (repo.id to count)
-                        RepoStatusStore.setChangeCount(repo.id, count)
+        viewModelScope.launch { computeChangeCount(repo) }
+    }
+
+    /**
+     * Counts a repo's uncommitted changes. Bounded (three at a time, instead of every repo
+     * hammering the disk simultaneously) and de-duplicated (a repo already being scanned isn't
+     * scanned again), and suspending - so callers like pull-to-refresh can genuinely wait for it.
+     */
+    private suspend fun computeChangeCount(repo: RepoEntity) {
+        if (!inFlight.add(repo.id)) return
+        try {
+            statusLimit.withPermit {
+                when (val opened = GitEngine.openRepo(repo.fullSavePath)) {
+                    is GitResult.Error -> Unit // leave uncomputed rather than showing a false "0"
+                    is GitResult.Success -> {
+                        val git = opened.data
+                        try {
+                            val statusResult = GitEngine.getStatus(git)
+                            if (statusResult is GitResult.Success) {
+                                val count = statusResult.data.map { it.path }.distinct().size
+                                changeCounts.value = changeCounts.value + (repo.id to count)
+                                RepoStatusStore.setChangeCount(repo.id, count)
+                            }
+                        } finally {
+                            git.close()
+                        }
                     }
-                    git.close()
                 }
             }
+        } finally {
+            inFlight.remove(repo.id)
         }
     }
 
@@ -136,7 +166,9 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             isRefreshing.value = true
             val added = repoRepository.scanForLocalRepos(appRef)
-            repoRepository.allRepos.first().forEach { loadChangeCount(it) }
+            coroutineScope {
+                repoRepository.allRepos.first().map { repo -> async { computeChangeCount(repo) } }.awaitAll()
+            }
             if (added > 0) {
                 snackbarMessage.value = if (added == 1) "Found 1 local repo" else "Found $added local repos"
             }
@@ -202,52 +234,62 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
     }
 
 
-    fun fetch(repo: RepoEntity) = remoteOp(repo) { git, cred ->
-        GitEngine.fetch(git, credential = cred).also { r ->
+    fun fetch(repo: RepoEntity) = remoteOp(repo, TransferKind.FETCH) { git, cred, monitor ->
+        GitEngine.fetch(git, credential = cred, monitor = monitor).also { r ->
             if (r is GitResult.Success) snackbarMessage.value = "${repo.name}: ${r.data}"
         }
     }
 
-    fun pull(repo: RepoEntity) = remoteOp(repo) { git, cred ->
-        GitEngine.pullMerge(git, cred).also { r ->
+    fun pull(repo: RepoEntity) = remoteOp(repo, TransferKind.PULL) { git, cred, monitor ->
+        GitEngine.pullMerge(git, cred, monitor).also { r ->
             if (r is GitResult.Success) snackbarMessage.value = "${repo.name}: ${r.data}"
         }
     }
 
-    fun pullForce(repo: RepoEntity) = remoteOp(repo) { git, cred ->
-        GitEngine.pullForce(git, cred).also { r ->
+    fun pullForce(repo: RepoEntity) = remoteOp(repo, TransferKind.PULL) { git, cred, monitor ->
+        GitEngine.pullForce(git, cred, monitor).also { r ->
             if (r is GitResult.Success) snackbarMessage.value = "${repo.name}: ${r.data}"
         }
     }
 
-    fun push(repo: RepoEntity) = remoteOp(repo) { git, cred ->
-        GitEngine.push(git, credential = cred).also { r ->
+    fun push(repo: RepoEntity) = remoteOp(repo, TransferKind.PUSH) { git, cred, monitor ->
+        GitEngine.push(git, credential = cred, monitor = monitor).also { r ->
             if (r is GitResult.Success) snackbarMessage.value = "Pushed ${repo.name}"
         }
     }
 
-    fun pushForce(repo: RepoEntity) = remoteOp(repo) { git, cred ->
-        GitEngine.push(git, force = true, credential = cred).also { r ->
+    fun pushForce(repo: RepoEntity) = remoteOp(repo, TransferKind.PUSH) { git, cred, monitor ->
+        GitEngine.push(git, force = true, credential = cred, monitor = monitor).also { r ->
             if (r is GitResult.Success) snackbarMessage.value = "Force pushed ${repo.name}"
         }
     }
 
-    private fun remoteOp(repo: RepoEntity, block: suspend (org.eclipse.jgit.api.Git, dev.graft.app.data.repository.DecryptedCredential?) -> GitResult<*>) {
+    /**
+     * Runs the operation as a background transfer (visible in the Transfers list and as a progress
+     * bar on the card, and unaffected by leaving this screen), then reports the outcome here.
+     */
+    private fun remoteOp(
+        repo: RepoEntity,
+        kind: TransferKind,
+        block: suspend (org.eclipse.jgit.api.Git, dev.graft.app.data.repository.DecryptedCredential?, ProgressMonitor) -> GitResult<*>,
+    ) {
         viewModelScope.launch {
             busyRepoId.value = repo.id
             val cred = if (repo.credentialId != 0L) credentialRepository.getById(repo.credentialId) else null
-            when (val open = GitEngine.openRepo(repo.fullSavePath)) {
-                is GitResult.Error -> fail(repo, open.message)
+            val manager = appRef.transferManager
+            val outcome = manager.enqueue(
+                kind = kind, repoId = repo.id, title = repo.name, watchDir = File(repo.fullSavePath),
+            ) { reporter ->
+                manager.withGit(repo.fullSavePath) { git -> block(git, cred, reporter.monitor) }
+            }.awaitResult()
+
+            when (outcome) {
+                is GitResult.Error ->
+                    if (outcome.message == "Cancelled") snackbarMessage.value = "${repo.name}: cancelled"
+                    else fail(repo, outcome.message)
                 is GitResult.Success -> {
-                    val git = open.data
-                    when (val r = block(git, cred)) {
-                        is GitResult.Error -> fail(repo, r.message)
-                        is GitResult.Success -> {
-                            repoRepository.markSyncSuccess(repo.id)
-                            loadChangeCount(repo)
-                        }
-                    }
-                    git.close()
+                    repoRepository.markSyncSuccess(repo.id)
+                    loadChangeCount(repo)
                 }
             }
             busyRepoId.value = null

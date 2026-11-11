@@ -184,6 +184,24 @@ fun AddRepoSheet(
                 modifier = Modifier.fillMaxWidth()
             )
 
+            if (isClone) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Latest commit only", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Much faster and smaller - skips the project's history",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = state.shallow, onCheckedChange = viewModel::onShallowChanged)
+                }
+            }
+
             if (!isClone) {
                 Row(
                     Modifier.fillMaxWidth(),
@@ -283,7 +301,7 @@ fun AddRepoSheet(
                         color = MaterialTheme.colorScheme.onPrimary
                     )
                     Spacer(Modifier.width(10.dp))
-                    Text(state.progress ?: if (isClone) "Cloning…" else "Creating…")
+                    Text(if (isClone) "Starting…" else "Creating…")
                 } else {
                     Text(if (isClone) "Clone" else "Create repository")
                 }

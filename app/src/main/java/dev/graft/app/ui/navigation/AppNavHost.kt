@@ -37,6 +37,7 @@ import dev.graft.app.ui.screens.search.SearchScreen
 import dev.graft.app.ui.screens.settings.SettingsScreen
 import dev.graft.app.ui.screens.stash.StashScreen
 import dev.graft.app.ui.screens.tags.TagsScreen
+import dev.graft.app.ui.screens.transfers.TransfersScreen
 import java.net.URLDecoder
 
 private const val SLIDE_MS = 240
@@ -112,6 +113,7 @@ fun AppNavHost(nav: NavHostController) {
                 onOpenCredentials = { nav.navigate(Routes.CREDENTIALS) },
                 onOpenDiscover = { nav.navigateHomeTab(HomeTab.DISCOVER) },
                 onOpenSettings = { nav.navigateHomeTab(HomeTab.SETTINGS) },
+                onOpenTransfers = { nav.navigate(Routes.TRANSFERS) },
             )
         }
         composable(Routes.DISCOVER) { DiscoverScreen() }
@@ -122,6 +124,15 @@ fun AppNavHost(nav: NavHostController) {
             )
         }
         composable(Routes.CREDENTIALS) { CredentialScreen(onBack = { nav.popBackStack() }) }
+        composable(
+            Routes.TRANSFERS,
+            deepLinks = listOf(navDeepLink { uriPattern = "graft://transfers" }),
+        ) {
+            TransfersScreen(
+                onBack = { if (!nav.popBackStack()) nav.navigate(Routes.REPOS) },
+                onOpenRepo = { id -> nav.navigate(Routes.overview(id)) },
+            )
+        }
         composable(Routes.APK_DOWNLOADS) { ApkExplorerScreen(onBack = { nav.popBackStack() }) }
 
         // ---------------------------------------------------------------- Repo scope

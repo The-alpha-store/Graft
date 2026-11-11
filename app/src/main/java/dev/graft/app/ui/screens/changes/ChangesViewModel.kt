@@ -6,6 +6,12 @@ import androidx.lifecycle.viewModelScope
 import dev.graft.app.App
 import dev.graft.app.data.CommitPrefs
 import dev.graft.app.data.RepoStatusStore
+import java.io.File
+import org.eclipse.jgit.lib.ProgressMonitor
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.async
+import dev.graft.app.transfer.awaitResult
+import dev.graft.app.transfer.TransferKind
 import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.data.github.GitHubApi
 import dev.graft.app.data.github.GitHubResult
@@ -131,17 +137,47 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh() { viewModelScope.launch { _state.value.repo?.let { openAndRefresh(it) } } }
 
+    /**
+     * Reuses the open repository handle (re-opening on every refresh re-reads config and re-scans
+     * packs each time, and the old handles were never closed), then gathers everything the screen
+     * needs *in parallel* - branch, ahead/behind, upstream, last commit and working-tree status are
+     * independent reads, so waiting on them one after another just added up their latencies.
+     */
     private suspend fun openAndRefresh(repo: RepoEntity) {
-        val result = GitEngine.openRepo(repo.fullSavePath)
-        if (result is GitResult.Error) { err("Open failed: ${result.message}"); return }
-        val g = (result as GitResult.Success).data
-        git = g
+        val g = ensureOpen(repo) ?: return
 
-        val branch = GitEngine.getCurrentBranch(g).getOrNull() ?: ""
-        val ab = GitEngine.getAheadBehind(g).getOrNull() ?: Pair(0, 0)
-        val upstream = GitEngine.hasUpstream(g).getOrNull()
-        val statusLine = buildStatusLine(g)
+        val snapshot = coroutineScope {
+            val branch = async { GitEngine.getCurrentBranch(g).getOrNull() ?: "" }
+            val ab = async { GitEngine.getAheadBehind(g).getOrNull() ?: Pair(0, 0) }
+            val upstream = async { GitEngine.hasUpstream(g).getOrNull() }
+            val line = async { buildStatusLine(g) }
+            val status = async { GitEngine.getStatus(g) }
+            Snapshot(branch.await(), ab.await(), upstream.await(), line.await(), status.await())
+        }
 
+        when (val sr = snapshot.status) {
+            is GitResult.Error -> err("Status failed: ${sr.message}")
+            is GitResult.Success -> {
+                RepoStatusStore.setChangeCount(repo.id, sr.data.map { it.path }.distinct().size)
+                val (stg, unstg) = sr.data.partition { it.staged }
+                _state.value = _state.value.copy(
+                    staged = stg, unstaged = unstg, isLoading = false,
+                    currentBranch = snapshot.branch, ahead = snapshot.aheadBehind.first,
+                    behind = snapshot.aheadBehind.second,
+                    statusLine = snapshot.statusLine, hasUpstream = snapshot.upstream,
+                    hasConflicts = unstg.any { it.status == dev.graft.app.git.GitFileStatus.CONFLICTED },
+                )
+            }
+        }
+    }
+
+    /**
+     * Cheaper refresh for operations that can only change the working tree / index (stage, unstage,
+     * discard): the branch, upstream, ahead/behind and last commit can't have moved, so only the
+     * status needs recomputing.
+     */
+    private suspend fun refreshStatusOnly(repo: RepoEntity) {
+        val g = ensureOpen(repo) ?: return
         when (val sr = GitEngine.getStatus(g)) {
             is GitResult.Error -> err("Status failed: ${sr.message}")
             is GitResult.Success -> {
@@ -149,12 +185,32 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
                 val (stg, unstg) = sr.data.partition { it.staged }
                 _state.value = _state.value.copy(
                     staged = stg, unstaged = unstg, isLoading = false,
-                    currentBranch = branch, ahead = ab.first, behind = ab.second,
-                    statusLine = statusLine, hasUpstream = upstream,
                     hasConflicts = unstg.any { it.status == dev.graft.app.git.GitFileStatus.CONFLICTED },
                 )
             }
         }
+    }
+
+    private suspend fun ensureOpen(repo: RepoEntity): Git? {
+        git?.let { return it }
+        return when (val result = GitEngine.openRepo(repo.fullSavePath)) {
+            is GitResult.Error -> { err("Open failed: ${result.message}"); null }
+            is GitResult.Success -> result.data.also { git = it }
+        }
+    }
+
+    private class Snapshot(
+        val branch: String,
+        val aheadBehind: Pair<Int, Int>,
+        val upstream: Boolean?,
+        val statusLine: String,
+        val status: GitResult<List<GitFileEntry>>,
+    )
+
+    override fun onCleared() {
+        runCatching { git?.close() }
+        git = null
+        super.onCleared()
     }
 
     private suspend fun buildStatusLine(g: Git): String {
@@ -164,15 +220,14 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onCommitMessageChanged(v: String) { _state.value = _state.value.copy(commitMessage = v) }
 
-    fun stageFile(e: GitFileEntry) = gitOp { g -> GitEngine.stageFile(g, e.path) }
-    fun unstageFile(e: GitFileEntry) = gitOp { g -> GitEngine.unstageFile(g, e.path) }
-    fun stageAll() = gitOp { g -> GitEngine.stageAll(g) }
-    fun unstageAll() = gitOp { g ->
-        _state.value.staged.forEach { GitEngine.unstageFile(g, it.path) }
-        GitResult.Success(Unit)
+    fun stageFile(e: GitFileEntry) = gitOp(light = true) { g -> GitEngine.stageFile(g, e.path) }
+    fun unstageFile(e: GitFileEntry) = gitOp(light = true) { g -> GitEngine.unstageFile(g, e.path) }
+    fun stageAll() = gitOp(light = true) { g -> GitEngine.stageAll(g) }
+    fun unstageAll() = gitOp(light = true) { g ->
+        GitEngine.unstageFiles(g, _state.value.staged.map { it.path })
     }
-    fun discardFile(e: GitFileEntry) = gitOp { g -> GitEngine.discardFile(g, e.path) }
-    fun discardAll() = gitOp { g -> GitEngine.discardAllChanges(g) }
+    fun discardFile(e: GitFileEntry) = gitOp(light = true) { g -> GitEngine.discardFile(g, e.path) }
+    fun discardAll() = gitOp(light = true) { g -> GitEngine.discardAllChanges(g) }
 
     fun stageAllAndCommit() {
         val msg = _state.value.commitMessage
@@ -258,7 +313,13 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
 
             if (failure == null) {
                 val cred = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
-                when (val pushResult = GitEngine.push(g, credential = cred)) {
+                val manager = appRef.transferManager
+                val pushOutcome = manager.enqueue(
+                    kind = TransferKind.PUSH, repoId = repo.id, title = repo.name, watchDir = File(repo.fullSavePath),
+                ) { reporter ->
+                    manager.withGit(repo.fullSavePath) { pg -> GitEngine.push(pg, credential = cred, monitor = reporter.monitor) }
+                }.awaitResult()
+                when (val pushResult = pushOutcome) {
                     is GitResult.Error -> {
                         repoRepo.markError(repo.id, pushResult.message)
                         failure = pushResult.message
@@ -291,14 +352,14 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
         gitOp { g -> GitEngine.cherryPick(g, sha) }
     }
 
-    fun fetch() = remoteOp { g, cred -> GitEngine.fetch(g, credential = cred) }
-    fun pullMerge() = remoteOp { g, cred -> GitEngine.pullMerge(g, cred) }
-    fun pullRebase() = remoteOp { g, cred -> GitEngine.pullRebase(g, cred) }
-    fun pullForce() = remoteOp { g, cred -> GitEngine.pullForce(g, cred) }
-    fun push() = remoteOp(isPush = true) { g, cred -> GitEngine.push(g, credential = cred) }
-    fun pushForce() = remoteOp(isPush = true) { g, cred -> GitEngine.push(g, force = true, credential = cred) }
-    fun syncMerge() = remoteOp { g, cred -> GitEngine.syncMerge(g, cred) }
-    fun syncRebase() = remoteOp { g, cred -> GitEngine.syncRebase(g, cred) }
+    fun fetch() = remoteOp(TransferKind.FETCH) { g, cred, m -> GitEngine.fetch(g, credential = cred, monitor = m) }
+    fun pullMerge() = remoteOp(TransferKind.PULL) { g, cred, m -> GitEngine.pullMerge(g, cred, m) }
+    fun pullRebase() = remoteOp(TransferKind.PULL) { g, cred, m -> GitEngine.pullRebase(g, cred, m) }
+    fun pullForce() = remoteOp(TransferKind.PULL) { g, cred, m -> GitEngine.pullForce(g, cred, m) }
+    fun push() = remoteOp(TransferKind.PUSH, isPush = true) { g, cred, m -> GitEngine.push(g, credential = cred, monitor = m) }
+    fun pushForce() = remoteOp(TransferKind.PUSH, isPush = true) { g, cred, m -> GitEngine.push(g, force = true, credential = cred, monitor = m) }
+    fun syncMerge() = remoteOp(TransferKind.SYNC) { g, cred, m -> GitEngine.syncMerge(g, cred, m) }
+    fun syncRebase() = remoteOp(TransferKind.SYNC) { g, cred, m -> GitEngine.syncRebase(g, cred, m) }
 
     fun resetSoft() = gitOp { g -> GitEngine.resetSoft(g) }
     fun resetMixed() = gitOp { g -> GitEngine.resetMixed(g) }
@@ -342,7 +403,7 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
     private fun authorName(): String = dev.graft.app.data.GitIdentityPrefs.currentName(appRef)
     private fun authorEmail(): String = dev.graft.app.data.GitIdentityPrefs.currentEmail(appRef)
 
-    private fun gitOp(block: suspend (Git) -> GitResult<*>) {
+    private fun gitOp(light: Boolean = false, block: suspend (Git) -> GitResult<*>) {
         val g = git ?: run { err("Repo not open"); return }
         viewModelScope.launch {
             _state.value = _state.value.copy(isWorking = true)
@@ -355,30 +416,43 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
                         else -> "Done"
                     }
                     ok(msg)
-                    _state.value.repo?.let { openAndRefresh(it) }
+                    _state.value.repo?.let { if (light) refreshStatusOnly(it) else openAndRefresh(it) }
                 }
             }
             _state.value = _state.value.copy(isWorking = false)
         }
     }
 
+    /**
+     * Runs a network operation as a background *transfer*: it shows up in the Transfers list with
+     * live progress, keeps going if you leave this screen (or the app), and works on its own repo
+     * handle so nothing here can pull it out from under it. This function just waits for the
+     * outcome so it can report it and refresh the file list.
+     */
     private fun remoteOp(
+        kind: TransferKind,
         isPush: Boolean = false,
-        block: suspend (Git, dev.graft.app.data.repository.DecryptedCredential?) -> GitResult<*>,
+        block: suspend (Git, dev.graft.app.data.repository.DecryptedCredential?, ProgressMonitor) -> GitResult<*>,
     ) {
         val repo = _state.value.repo ?: run { err("Repo not loaded"); return }
-        val g = git ?: run { err("Repo not open"); return }
         viewModelScope.launch {
             _state.value = _state.value.copy(isWorking = true)
             val cred = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
-            when (val r = block(g, cred)) {
+            val manager = appRef.transferManager
+            val outcome = manager.enqueue(
+                kind = kind, repoId = repo.id, title = repo.name, watchDir = File(repo.fullSavePath),
+            ) { reporter ->
+                manager.withGit(repo.fullSavePath) { g -> block(g, cred, reporter.monitor) }
+            }.awaitResult()
+
+            when (outcome) {
                 is GitResult.Error -> {
-                    repoRepo.markError(repo.id, r.message)
-                    err(r.message)
+                    repoRepo.markError(repo.id, outcome.message)
+                    err(outcome.message)
                 }
                 is GitResult.Success -> {
                     repoRepo.markSyncSuccess(repo.id)
-                    val msg = when (val d = r.data) { is String -> d; else -> "Done" }
+                    val msg = when (val d = outcome.data) { is String -> d; else -> "Done" }
                     if (isPush) {
                         _state.value = _state.value.copy(pushSuccessTick = _state.value.pushSuccessTick + 1)
                     } else {

@@ -41,6 +41,14 @@
     -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+        Transfers (clone / pull / push) run in a foreground service so they keep going - with a
+        progress notification - when the app is backgrounded. Android 14+ requires the specific
+        foreground-service type permission as well. See transfer/TransferService.kt.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <application
         android:name=".App"
         android:allowBackup="false"
@@ -76,8 +84,15 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="graft" android:host="repo" />
+                <data android:scheme="graft" android:host="transfers" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps transfers alive in the background; see transfer/TransferService.kt -->
+        <service
+            android:name=".transfer.TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!--
             Scoped only to the apk-downloads folders (see res/xml/file_paths.xml and

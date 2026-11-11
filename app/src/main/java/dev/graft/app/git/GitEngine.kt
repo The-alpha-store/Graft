@@ -11,6 +11,7 @@ import org.eclipse.jgit.api.ResetCommand
 import org.eclipse.jgit.lib.BranchTrackingStatus
 import org.eclipse.jgit.lib.PersonIdent
 import org.eclipse.jgit.lib.ProgressMonitor
+import org.eclipse.jgit.transport.TagOpt
 import org.eclipse.jgit.revwalk.RevWalk
 import org.eclipse.jgit.transport.RefSpec
 import org.eclipse.jgit.transport.RemoteConfig
@@ -26,6 +27,9 @@ object GitEngine {
     private fun DecryptedCredential.toProvider() =
         UsernamePasswordCredentialsProvider(username, token)
 
+    /** Seconds of network *inactivity* before a transfer gives up (not a total time limit). */
+    private const val NET_TIMEOUT_SEC = 45
+
     private suspend fun <T> io(block: () -> T): GitResult<T> =
         withContext(Dispatchers.IO) { gitTry(block) }
 
@@ -37,22 +41,20 @@ object GitEngine {
         url: String, localPath: String, branch: String = "",
         shallow: Boolean = false, depth: Int = 1,
         credential: DecryptedCredential? = null,
-        /** Called with JGit's phase titles ("Receiving objects", "Resolving deltas"...). */
-        onProgress: (String) -> Unit = {},
+        /** Receives JGit's phases and counts; also how a running clone gets cancelled. */
+        monitor: ProgressMonitor? = null,
     ): GitResult<Git> = io {
         val cmd = Git.cloneRepository().setURI(url).setDirectory(File(localPath))
-            .setProgressMonitor(object : ProgressMonitor {
-                override fun start(totalTasks: Int) {}
-                override fun beginTask(title: String?, totalWork: Int) {
-                    if (!title.isNullOrBlank()) onProgress(title)
-                }
-                override fun update(completed: Int) {}
-                override fun endTask() {}
-                override fun isCancelled(): Boolean = false
-                override fun showDuration(enabled: Boolean) {}
-            })
+            .setTimeout(NET_TIMEOUT_SEC)
+        monitor?.let { cmd.setProgressMonitor(it) }
         if (branch.isNotBlank()) cmd.setBranch(branch)
         if (shallow) cmd.setDepth(depth)
+        // Asking for one branch (or a shallow clone) should fetch exactly that - not every branch on
+        // the remote, which on a busy repo is most of the download.
+        if (branch.isNotBlank()) {
+            cmd.setCloneAllBranches(false)
+            cmd.setBranchesToClone(listOf("refs/heads/$branch"))
+        }
         credential?.let { cmd.setCredentialsProvider(it.toProvider()) }
         cmd.call()
     }
@@ -110,9 +112,32 @@ object GitEngine {
         Unit
     }
 
+    /**
+     * Stages everything: new + modified files, and deletions of tracked files.
+     *
+     * Previously this ran `add .` and then `add -u .` - two complete working-tree walks and two index
+     * writes. The first already covers new and modified content; the second existed only to catch
+     * deletions. Those can be found far more cheaply by stat-ing the files the *index* already lists
+     * (no directory listing, no ignore-rule matching), then removing them in one RmCommand.
+     */
     suspend fun stageAll(git: Git): GitResult<Unit> = io {
-        git.add().addFilepattern(".").call() // new + modified content
-        git.add().setUpdate(true).addFilepattern(".").call() // deletions of tracked files
+        git.add().addFilepattern(".").call()
+
+        val repo = git.repository
+        val workTree = repo.workTree
+        val cache = repo.readDirCache()
+        val missing = ArrayList<String>()
+        for (i in 0 until cache.entryCount) {
+            val entry = cache.getEntry(i)
+            if (entry.stage != 0 || entry.fileMode == org.eclipse.jgit.lib.FileMode.GITLINK) continue
+            val path = entry.pathString
+            if (!File(workTree, path).exists()) missing.add(path)
+        }
+        if (missing.isNotEmpty()) {
+            val rm = git.rm()
+            missing.forEach { rm.addFilepattern(it) }
+            rm.call()
+        }
         Unit
     }
 
@@ -151,6 +176,16 @@ object GitEngine {
         git.reset().addPath(path).call(); Unit
     }
 
+    /** Unstages many paths with one reset / one index write, instead of one per file. */
+    suspend fun unstageFiles(git: Git, paths: Collection<String>): GitResult<Unit> = io {
+        if (paths.isNotEmpty()) {
+            val reset = git.reset()
+            paths.forEach { reset.addPath(it) }
+            reset.call()
+        }
+        Unit
+    }
+
     suspend fun discardFile(git: Git, path: String): GitResult<Unit> = io {
         git.checkout().addPath(path).call(); Unit
     }
@@ -175,33 +210,39 @@ object GitEngine {
     suspend fun fetch(
         git: Git, remote: String = "origin", prune: Boolean = true,
         credential: DecryptedCredential? = null,
+        monitor: ProgressMonitor? = null,
+        /** Skip tag objects - much faster on repos with thousands of tags. */
+        skipTags: Boolean = false,
     ): GitResult<String> = io {
-        val r = git.fetch().setRemote(remote).setRemoveDeletedRefs(prune)
-            .also { credential?.let { c -> it.setCredentialsProvider(c.toProvider()) } }
-            .call()
+        val cmd = git.fetch().setRemote(remote).setRemoveDeletedRefs(prune).setTimeout(NET_TIMEOUT_SEC)
+        if (skipTags) cmd.setTagOpt(TagOpt.NO_TAGS)
+        monitor?.let { cmd.setProgressMonitor(it) }
+        credential?.let { c -> cmd.setCredentialsProvider(c.toProvider()) }
+        val r = cmd.call()
         if (r.advertisedRefs.isEmpty()) "Already up to date" else "Fetched from $remote"
     }
 
-    /** Same fetch as above, but also reports how many remote-tracking refs actually moved —
+    /** Same fetch as above, but also reports how many remote-tracking refs actually moved -
      *  what [SyncWorker] uses to decide whether a repo genuinely has new commits worth a
-     *  notification, versus a fetch that ran and found nothing new. JGit's own
-     *  `trackingRefUpdates` is the right signal here (rather than e.g. comparing ahead/behind
-     *  counts before and after): it reflects every branch that moved, not just the current
-     *  one, and a fetch with zero tracking ref updates really did find nothing new. */
+     *  notification, versus a fetch that ran and found nothing new. Tags are skipped: a new tag is
+     *  not "new commits", and skipping them makes the background check much cheaper. */
     suspend fun fetchAndCountUpdates(
         git: Git, remote: String = "origin", prune: Boolean = true,
         credential: DecryptedCredential? = null,
     ): GitResult<Int> = io {
-        val r = git.fetch().setRemote(remote).setRemoveDeletedRefs(prune)
-            .also { credential?.let { c -> it.setCredentialsProvider(c.toProvider()) } }
-            .call()
-        r.trackingRefUpdates.size
+        val cmd = git.fetch().setRemote(remote).setRemoveDeletedRefs(prune)
+            .setTagOpt(TagOpt.NO_TAGS).setTimeout(NET_TIMEOUT_SEC)
+        credential?.let { c -> cmd.setCredentialsProvider(c.toProvider()) }
+        cmd.call().trackingRefUpdates.size
     }
 
     // ── pull ──────────────────────────────────────────────────────────────────
 
-    suspend fun pullMerge(git: Git, credential: DecryptedCredential? = null): GitResult<String> = io {
-        val cmd = git.pull().setRebase(false)
+    suspend fun pullMerge(
+        git: Git, credential: DecryptedCredential? = null, monitor: ProgressMonitor? = null,
+    ): GitResult<String> = io {
+        val cmd = git.pull().setRebase(false).setTimeout(NET_TIMEOUT_SEC)
+        monitor?.let { cmd.setProgressMonitor(it) }
         credential?.let { cmd.setCredentialsProvider(it.toProvider()) }
         val r = cmd.call()
         if (!r.isSuccessful)
@@ -209,8 +250,11 @@ object GitEngine {
         r.mergeResult?.mergeStatus?.toString() ?: "Already up to date"
     }
 
-    suspend fun pullRebase(git: Git, credential: DecryptedCredential? = null): GitResult<String> = io {
-        val cmd = git.pull().setRebase(true)
+    suspend fun pullRebase(
+        git: Git, credential: DecryptedCredential? = null, monitor: ProgressMonitor? = null,
+    ): GitResult<String> = io {
+        val cmd = git.pull().setRebase(true).setTimeout(NET_TIMEOUT_SEC)
+        monitor?.let { cmd.setProgressMonitor(it) }
         credential?.let { cmd.setCredentialsProvider(it.toProvider()) }
         val r = cmd.call()
         if (!r.isSuccessful)
@@ -218,10 +262,14 @@ object GitEngine {
         r.rebaseResult?.status?.toString() ?: "Already up to date"
     }
 
-    suspend fun pullForce(git: Git, credential: DecryptedCredential? = null): GitResult<String> = io {
+    suspend fun pullForce(
+        git: Git, credential: DecryptedCredential? = null, monitor: ProgressMonitor? = null,
+    ): GitResult<String> = io {
         val branch = git.repository.branch
-        git.fetch().setRemote("origin")
-            .also { credential?.let { c -> it.setCredentialsProvider(c.toProvider()) } }.call()
+        val cmd = git.fetch().setRemote("origin").setTimeout(NET_TIMEOUT_SEC)
+        monitor?.let { cmd.setProgressMonitor(it) }
+        credential?.let { c -> cmd.setCredentialsProvider(c.toProvider()) }
+        cmd.call()
         git.reset().setMode(ResetCommand.ResetType.HARD).setRef("origin/$branch").call()
         "Force-reset to origin/$branch"
     }
@@ -230,9 +278,10 @@ object GitEngine {
 
     suspend fun push(
         git: Git, remote: String = "origin", force: Boolean = false,
-        credential: DecryptedCredential? = null,
+        credential: DecryptedCredential? = null, monitor: ProgressMonitor? = null,
     ): GitResult<String> = io {
-        val cmd = git.push().setRemote(remote).setForce(force)
+        val cmd = git.push().setRemote(remote).setForce(force).setTimeout(NET_TIMEOUT_SEC)
+        monitor?.let { cmd.setProgressMonitor(it) }
         credential?.let { cmd.setCredentialsProvider(it.toProvider()) }
         val results = cmd.call().toList()
         val rejected = results.flatMap { pr ->
@@ -257,18 +306,22 @@ object GitEngine {
 
     // ── sync ──────────────────────────────────────────────────────────────────
 
-    suspend fun syncMerge(git: Git, credential: DecryptedCredential? = null): GitResult<String> {
-        val pull = pullMerge(git, credential)
+    suspend fun syncMerge(
+        git: Git, credential: DecryptedCredential? = null, monitor: ProgressMonitor? = null,
+    ): GitResult<String> {
+        val pull = pullMerge(git, credential, monitor)
         if (pull is GitResult.Error) return pull
-        val push = push(git, credential = credential)
+        val push = push(git, credential = credential, monitor = monitor)
         if (push is GitResult.Error) return push
         return GitResult.Success("Sync(Merge) done")
     }
 
-    suspend fun syncRebase(git: Git, credential: DecryptedCredential? = null): GitResult<String> {
-        val pull = pullRebase(git, credential)
+    suspend fun syncRebase(
+        git: Git, credential: DecryptedCredential? = null, monitor: ProgressMonitor? = null,
+    ): GitResult<String> {
+        val pull = pullRebase(git, credential, monitor)
         if (pull is GitResult.Error) return pull
-        val push = push(git, credential = credential)
+        val push = push(git, credential = credential, monitor = monitor)
         if (push is GitResult.Error) return push
         return GitResult.Success("Sync(Rebase) done")
     }
