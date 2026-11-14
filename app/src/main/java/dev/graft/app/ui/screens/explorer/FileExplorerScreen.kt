@@ -42,6 +42,7 @@ import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitFileStatus
 import dev.graft.app.git.GitResult
 import dev.graft.app.transfer.awaitResult
+import dev.graft.app.transfer.formatBytes
 import dev.graft.app.ui.components.RepoTitleBlock
 import dev.graft.app.ui.components.ConfirmDialog
 import dev.graft.app.ui.components.SingleInputDialog
@@ -613,6 +614,8 @@ fun FileExplorerScreen(
     onOpenFile: (String) -> Unit,
     onOpenBlame: (String) -> Unit,
     onOpenSearch: () -> Unit = {},
+    onOpenGitignore: () -> Unit = {},
+    onOpenActions: () -> Unit = {},
     vm: FileExplorerViewModel = viewModel(),
 ) {
     val state by vm.uiState.collectAsState()
@@ -765,9 +768,16 @@ fun FileExplorerScreen(
                         )
                     }
                 }
-                else -> LazyColumn(
-                    contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
-                    modifier = Modifier.fillMaxSize().padding(pad),
+                else -> Column(Modifier.fillMaxSize().padding(pad)) {
+                ExplorerActionHeader(
+                    onGitignore = onOpenGitignore,
+                    onActions = onOpenActions,
+                    onFind = { showFilter = true },
+                )
+                LazyColumn(
+                    // Side margins make each row a card floating inside the page, as in the original.
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 2.dp, bottom = 96.dp),
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
                 ) {
                     items(state.visibleRows, key = { it.node.relativePath }) { row ->
                         TreeRowItem(
@@ -795,6 +805,7 @@ fun FileExplorerScreen(
                             onImportFilesHere = { createTargetPath = row.node.relativePath; importFilesLauncher.launch(arrayOf("*/*")) },
                         )
                     }
+                }
                 }
             }
         }
@@ -888,7 +899,6 @@ private fun TreeRowItem(
     val node = row.node
     var showMenu by remember { mutableStateOf(false) }
     val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
-    val (icon, iconTint) = fileIconFor(node)
 
     val statusColor = when (row.gitStatus) {
         GitFileStatus.ADDED -> MaterialTheme.gitColors.added
@@ -909,6 +919,9 @@ private fun TreeRowItem(
     Row(
         Modifier
             .fillMaxWidth()
+            // Indent first, *then* clip/background: the card itself steps in with depth.
+            .padding(start = (row.depth * 14).dp, top = 2.dp, bottom = 2.dp)
+            .clip(RoundedCornerShape(10.dp))
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = {
@@ -916,21 +929,13 @@ private fun TreeRowItem(
                     onLongClick()
                 },
             )
-            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else androidx.compose.ui.graphics.Color.Transparent)
-            .padding(vertical = 7.dp, horizontal = 6.dp),
+            .background(
+                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                else MaterialTheme.colorScheme.surfaceContainerLow,
+            )
+            .padding(start = 6.dp, end = 2.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Indentation guide lines — one thin vertical rule per ancestor level, the classic
-        // tree "ladder" so nesting depth reads at a glance even before you look at the icons.
-        repeat(row.depth) {
-            Box(Modifier.width(TREE_INDENT).fillMaxHeight()) {
-                Box(
-                    Modifier.width(1.dp).fillMaxHeight().align(Alignment.Center)
-                        .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.18f)),
-                )
-            }
-        }
-
         Box(Modifier.width(20.dp), contentAlignment = Alignment.Center) {
             if (node.isDirectory) {
                 val rotation by androidx.compose.animation.core.animateFloatAsState(if (row.isExpanded) 90f else 0f, label = "chevron")
@@ -947,17 +952,33 @@ private fun TreeRowItem(
             Spacer(Modifier.width(2.dp))
         }
 
-        Icon(icon, null, Modifier.size(18.dp), tint = iconTint)
-        Spacer(Modifier.width(8.dp))
+        if (node.isDirectory) {
+            Icon(
+                if (row.isExpanded) Icons.Filled.FolderOpen else Icons.Filled.Folder, null,
+                Modifier.size(24.dp), tint = MaterialTheme.colorScheme.secondary,
+            )
+        } else {
+            ExtensionBadge(node.name)
+        }
+        Spacer(Modifier.width(10.dp))
 
-        Text(
-            node.name,
-            style = MaterialTheme.typography.bodyMedium,
-            color = statusColor ?: MaterialTheme.colorScheme.onSurface,
-            fontWeight = if (row.hasDirtyDescendant && node.isDirectory) FontWeight.SemiBold else FontWeight.Normal,
-            maxLines = 1,
-            modifier = Modifier.weight(1f),
-        )
+        Column(Modifier.weight(1f)) {
+            Text(
+                node.name,
+                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                color = statusColor ?: MaterialTheme.colorScheme.onSurface,
+                fontWeight = if (node.isDirectory || (row.hasDirtyDescendant && node.isDirectory)) FontWeight.Bold else FontWeight.Normal,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+            if (!node.isDirectory && node.sizeBytes > 0) {
+                Text(
+                    formatBytes(node.sizeBytes),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
 
         when {
             statusLetter != null -> Text(
@@ -972,6 +993,11 @@ private fun TreeRowItem(
         // Compacted chain rows ("app/src/main") skip the per-row menu — renaming/deleting a
         // merged multi-folder row is ambiguous (which segment?), so only the leaf folders you
         // reach by expanding further, and plain files, get this menu.
+        if (!selectionMode && !node.isDirectory) {
+            IconButton(onClick = onClick, Modifier.size(30.dp)) {
+                Icon(Icons.Filled.Edit, "Open in editor", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+            }
+        }
         if (!selectionMode && !row.isCompactedChain) {
             Box {
                 IconButton(onClick = { showMenu = true }, Modifier.size(30.dp)) {

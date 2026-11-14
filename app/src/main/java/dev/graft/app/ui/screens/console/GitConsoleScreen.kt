@@ -14,7 +14,12 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import dev.graft.app.ui.components.ScreenTopBar
 import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Send
@@ -136,6 +141,24 @@ private val EXAMPLE_COMMANDS = listOf(
     "stash", "stash list", "stash pop", "tag", "remote -v",
 )
 
+private class QuickCommand(val label: String, val command: String, val runNow: Boolean)
+
+private val QUICK_COMMANDS = listOf(
+    QuickCommand("status", "status", runNow = true),
+    QuickCommand("log", "log --oneline -10", runNow = true),
+    QuickCommand("diff", "diff", runNow = true),
+    QuickCommand("branch", "branch -a", runNow = true),
+    QuickCommand("stash list", "stash list", runNow = true),
+    QuickCommand("add .", "add .", runNow = false),
+    QuickCommand("commit", "commit -m \"\"", runNow = false),
+    QuickCommand("pull", "pull", runNow = false),
+    QuickCommand("push", "push", runNow = false),
+)
+
+/** The whole session as plain text, the way it would look in a terminal. */
+private fun transcript(history: List<ConsoleLine>): String =
+    history.joinToString("\n\n") { "$ ${it.command}\n${it.output}".trimEnd() }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel = viewModel()) {
@@ -145,6 +168,8 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
     var showHelp by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
 
     LaunchedEffect(repoId) { vm.load(repoId) }
     LaunchedEffect(state.history.size) {
@@ -160,10 +185,18 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Console \u2014 ${state.repoName}", fontWeight = FontWeight.SemiBold, maxLines = 1) },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+            ScreenTopBar(
+                title = "Console",
+                subtitle = state.repoName,
+                onBack = onBack,
                 actions = {
+                    IconButton(
+                        onClick = {
+                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(transcript(state.history)))
+                            android.widget.Toast.makeText(context, "Transcript copied", android.widget.Toast.LENGTH_SHORT).show()
+                        },
+                        enabled = state.history.isNotEmpty(),
+                    ) { Icon(Icons.Filled.ContentCopy, "Copy transcript") }
                     IconButton(onClick = { showHelp = true }) { Icon(Icons.Filled.HelpOutline, "What's supported") }
                     IconButton(onClick = vm::clear, enabled = state.history.isNotEmpty()) { Icon(Icons.Filled.Delete, "Clear") }
                 },
@@ -172,18 +205,29 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).background(MaterialTheme.colorScheme.surfaceContainerLowest)) {
             if (state.history.isEmpty()) {
-                Column(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
-                    Text(
-                        "Type a git command below \u2014 same syntax as the real thing, run against this repo via the same engine every other screen uses.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, fontFamily = FontFamily.Monospace,
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Text("Try:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Column(
+                    Modifier.weight(1f).fillMaxWidth().padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Icon(Icons.Filled.Terminal, null, Modifier.size(44.dp), tint = MaterialTheme.gitColors.added)
+                    Spacer(Modifier.height(14.dp))
+                    Text("Git console", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            EXAMPLE_COMMANDS.take(4).forEach { ExampleChip(it) { input = it } }
-                        }
+                    Text(
+                        "Real git syntax, run against this repo by the same engine the rest of the app uses.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    Text("Try one", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        EXAMPLE_COMMANDS.forEach { ExampleChip(it) { input = it } }
                     }
                 }
             } else {
@@ -207,6 +251,22 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
+            // One-tap shortcuts. Read-only commands run immediately; ones that change something are
+            // only *filled in*, so a stray tap never commits or pushes.
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                QUICK_COMMANDS.forEach { quick ->
+                    ExampleChip(quick.label) {
+                        if (state.isRunning) return@ExampleChip
+                        if (quick.runNow) vm.submit(quick.command) else input = quick.command
+                    }
+                }
+            }
             Row(
                 Modifier.fillMaxWidth().imePadding().padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -311,13 +371,16 @@ private fun ConsoleLineView(line: ConsoleLine) {
         }
         if (line.output.isNotBlank()) {
             Spacer(Modifier.height(2.dp))
-            Text(
-                line.output,
-                fontFamily = FontFamily.Monospace,
-                color = if (line.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(start = 8.dp),
-            )
+            // Selectable: long-press to pick out a hash, a path or an error line.
+            androidx.compose.foundation.text.selection.SelectionContainer {
+                Text(
+                    line.output,
+                    fontFamily = FontFamily.Monospace,
+                    color = if (line.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
+            }
         }
     }
 }

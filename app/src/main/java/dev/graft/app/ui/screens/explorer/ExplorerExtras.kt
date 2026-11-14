@@ -1,6 +1,19 @@
 package dev.graft.app.ui.screens.explorer
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PlayCircleOutline
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import dev.graft.app.ui.theme.gitColors
+import dev.graft.app.ui.theme.hsl
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -179,5 +192,72 @@ private fun PropertyRow(label: String, value: String, mono: Boolean = false) {
         Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(2.dp))
         Text(value, style = if (mono) MaterialTheme.code.small else MaterialTheme.typography.bodyMedium)
+    }
+}
+
+
+/**
+ * The little colored square in front of a file name - its extension in a tinted tile (`KT`, `YML`,
+ * `MD`...), the way the original app drew its tree. The tint is a hue per file family at a lightness
+ * chosen for the current theme, so it stays legible in both light and dark.
+ */
+@Composable
+internal fun ExtensionBadge(fileName: String, modifier: Modifier = Modifier) {
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    val dark = MaterialTheme.gitColors.isDark
+    val hue: Float? = when (ext) {
+        "kt", "kts" -> 262f
+        "java" -> 28f
+        "yml", "yaml" -> 190f
+        "xml", "json" -> 175f
+        "md", "txt" -> 145f
+        "gradle", "properties", "toml" -> 40f
+        "sh", "bat" -> 210f
+        "png", "jpg", "jpeg", "webp", "svg", "gif" -> 300f
+        else -> null
+    }
+    val tint = if (hue != null) hsl(hue, 0.65f, if (dark) 0.68f else 0.36f) else MaterialTheme.colorScheme.onSurfaceVariant
+    Box(
+        modifier.size(24.dp).clip(RoundedCornerShape(6.dp)).background(tint.copy(alpha = 0.16f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            if (ext.length in 1..4) ext.uppercase() else "F",
+            style = MaterialTheme.code.tiny.copy(fontSize = 8.sp),
+            fontWeight = FontWeight.Bold,
+            color = tint,
+            maxLines = 1,
+        )
+    }
+}
+
+/** Shortcuts pinned above the tree: the repo's `.gitignore`, its CI, and whole-repo file search. */
+@Composable
+internal fun ExplorerActionHeader(
+    onGitignore: () -> Unit,
+    onActions: () -> Unit,
+    onFind: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FilledTonalButton(onClick = onGitignore, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+            Icon(Icons.Filled.Edit, null, Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(".gitignore", style = MaterialTheme.typography.labelLarge)
+        }
+        OutlinedButton(onClick = onActions, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+            Icon(Icons.Filled.PlayCircleOutline, null, Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("CI Actions", style = MaterialTheme.typography.labelLarge)
+        }
+        OutlinedButton(onClick = onFind, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+            Icon(Icons.Filled.Search, null, Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Find file", style = MaterialTheme.typography.labelLarge)
+        }
     }
 }

@@ -2,6 +2,8 @@ package dev.graft.app.data.repository
 
 import dev.graft.app.data.RepoStorage
 import dev.graft.app.data.db.dao.RepoDao
+import dev.graft.app.git.GitErrors
+import kotlinx.coroutines.flow.first
 import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitResult
@@ -26,7 +28,26 @@ class RepoRepository(private val dao: RepoDao) {
 
     suspend fun markSyncSuccess(id: Long) = dao.markSyncSuccess(id)
 
-    suspend fun markError(id: Long, error: String) = dao.markError(id, error)
+    /**
+     * Records a repo's lasting error - but only an *actionable* one (bad credentials, a rejected
+     * push...). A dropped connection or timeout is not a property of the repo, it's a property of the
+     * moment, so it's deliberately not stored: otherwise one sync pass in a tunnel leaves every
+     * repo showing a red "Error" until something happens to succeed. Those failures still surface
+     * where they happen - as a message, and as a retryable row in Transfers.
+     */
+    suspend fun markError(id: Long, error: String) {
+        if (GitErrors.isTransientMessage(error)) return
+        dao.markError(id, GitErrors.friendlyText(error))
+    }
+
+    suspend fun clearError(id: Long) = dao.clearError(id)
+
+    /** One-off tidy-up: drops stored errors that were really just network blips (from older builds). */
+    suspend fun clearTransientErrors() {
+        allRepos.first()
+            .filter { it.lastError.isNotBlank() && GitErrors.isTransientMessage(it.lastError) }
+            .forEach { dao.clearError(it.id) }
+    }
 
     suspend fun updateBranch(id: Long, branch: String) = dao.updateBranch(id, branch)
 

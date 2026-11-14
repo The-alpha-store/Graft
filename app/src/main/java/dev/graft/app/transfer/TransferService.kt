@@ -40,9 +40,8 @@ class TransferService : Service() {
 
         if (observer == null) {
             observer = scope.launch {
-                // StateFlow is already conflated (latest value wins), so the delay below is all
-                // that's needed to cap updates at ~2/sec; the system silently drops faster ones
-                // anyway.
+                // A StateFlow is already conflated, so the delay below is all it takes to cap this at
+                // ~2 notification updates a second (the system drops faster ones anyway).
                 manager.tasks.collect { tasks ->
                     val now = tasks.filter { it.state.isActive }
                     if (now.isEmpty()) {

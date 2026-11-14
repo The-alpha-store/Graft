@@ -83,6 +83,9 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), RepoListUiState())
 
     init {
+        // Older builds stored network blips ("cannot open git-upload-pack", "connection abort") as a
+        // permanent per-repo error; clear those so cards stop showing red for problems that have passed.
+        viewModelScope.launch { repoRepository.clearTransientErrors() }
         // Counts computed elsewhere (the Changes tab after a commit, the Overview) flow in here too,
         // so returning Home never shows a number from before you committed.
         viewModelScope.launch {
@@ -141,6 +144,10 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
         } finally {
             inFlight.remove(repo.id)
         }
+    }
+
+    fun dismissError(repo: RepoEntity) {
+        viewModelScope.launch { repoRepository.clearError(repo.id) }
     }
 
     fun dismissSnackbar() { snackbarMessage.value = null }

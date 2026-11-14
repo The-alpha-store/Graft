@@ -196,6 +196,26 @@ class TransferManagerTest {
     }
 
     @Test
+    fun `with no network a transfer fails immediately with a clear message and never starts`() = runBlocking {
+        val m = TransferManager(onStartService = {}, onResultNotification = {}, isOnline = { false })
+        val ran = AtomicBoolean(false)
+        val result = m.enqueue(TransferKind.PUSH, repoId = 1, title = "x") { ran.set(true); GitResult.Success("ok") }.awaitResult()
+
+        assertTrue(result is GitResult.Error)
+        val task = m.tasks.value.single()
+        assertEquals(TransferState.FAILED, task.state)
+        assertEquals(dev.graft.app.git.GitErrors.OFFLINE_MESSAGE, task.message)
+        assertFalse(ran.get())
+    }
+
+    @Test
+    fun `an exception from the work is humanised`() = runBlocking {
+        val m = newManager()
+        m.enqueue(TransferKind.FETCH, repoId = 1, title = "x") { throw java.net.SocketTimeoutException("read timed out") }.awaitResult()
+        assertEquals(dev.graft.app.git.GitErrors.TIMEOUT_MESSAGE, m.tasks.value.single().message)
+    }
+
+    @Test
     fun `clearFinished keeps active transfers`() = runBlocking {
         val m = newManager()
         m.enqueue(TransferKind.PUSH, repoId = 1, title = "done") { GitResult.Success("ok") }.awaitResult()

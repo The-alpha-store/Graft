@@ -205,17 +205,11 @@ private fun CommitRow(c: CommitInfo, graphRow: GraphRowLayout?, onClick: () -> U
 
 private val GRAPH_LANE_WIDTH = 18.dp
 
-/**
- * Cycles through the app's existing 3-color accent system rather than introducing new hues —
- * a lane's color has no persistent meaning across a repo's whole history anyway (lane 0 today
- * isn't "the same branch" as lane 0 a hundred commits back once branches fork and merge), so
- * what matters is that adjacent, currently-diverging lanes read as visually distinct, not
- * that any specific color maps to any specific named branch.
- *
- * The palette is a parameter rather than a top-level val because `MaterialTheme.colorScheme.*`
- * and `MaterialTheme.gitColors.*` are @Composable getters — they can only be read inside a
- * @Composable function, so the caller (CommitGraphLane) resolves them and passes them down.
- */
+/** Cycles through the app's existing 3-color accent system rather than introducing new hues —
+ *  a lane's color has no persistent meaning across a repo's whole history anyway (lane 0 today
+ *  isn't "the same branch" as lane 0 a hundred commits back once branches fork and merge), so
+ *  what matters is that adjacent, currently-diverging lanes read as visually distinct, not
+ *  that any specific color maps to any specific named branch. */
 private fun laneColor(lane: Int, palette: List<Color>): Color = palette[lane % palette.size]
 
 /**
@@ -238,13 +232,9 @@ private fun CommitGraphLane(row: GraphRowLayout?, modifier: Modifier = Modifier)
         return
     }
     val laneCount = row.laneCount.coerceAtLeast(1)
-    // Read the theme-backed colors here, in composable scope — the Canvas draw lambda below
-    // is not @Composable, so it can't touch MaterialTheme directly.
-    val palette = listOf(
-        MaterialTheme.colorScheme.primary,
-        MaterialTheme.colorScheme.secondary,
-        MaterialTheme.gitColors.added,
-    )
+    // Resolved here, in composable scope: theme colors can't be read inside the Canvas draw lambda,
+    // and a top-level val can't read them at all.
+    val palette = listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.secondary, MaterialTheme.gitColors.added)
     val myColor = laneColor(row.lane, palette)
     Canvas(modifier = modifier.width(GRAPH_LANE_WIDTH * laneCount)) {
         val laneWidthPx = GRAPH_LANE_WIDTH.toPx()

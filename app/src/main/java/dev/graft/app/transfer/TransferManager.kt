@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import dev.graft.app.git.GitEngine
+import dev.graft.app.git.GitErrors
 import dev.graft.app.git.GitResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -55,28 +56,25 @@ class TransferManager(
     private val onStartService: () -> Unit,
     /** Posts a "finished / failed" notification (only called while the app isn't on screen). */
     private val onResultNotification: (TransferTask) -> Unit,
+    /** False when there's clearly no network; the transfer then fails at once with a clear message. */
+    private val isOnline: () -> Boolean = { true },
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) {
     /** Production wiring. The two side effects are injected only so the scheduling rules - the
      *  concurrency limit, per-repo ordering, cancellation - can be unit-tested without Android. */
     constructor(context: Context) : this(
         onStartService = {
-            // Delegating-constructor arguments run before `this` exists, so the call site
-            // must not touch `this` - including implicitly. A bare `runCatching { }` here
-            // resolves to the `T.runCatching` extension (T = TransferManager), which binds
-            // an uninitialised `this` and fails to compile. Explicit try/catch has the same
-            // behaviour (swallow the failure) without any receiver binding.
+            // Explicit try/catch, not runCatching: in a delegating-constructor argument a bare
+            // `runCatching {}` resolves to the T.runCatching extension on an uninitialised `this`.
             try {
                 ContextCompat.startForegroundService(context, Intent(context, TransferService::class.java))
             } catch (e: Exception) {
-                // Service start not allowed right now (e.g. background start restrictions).
-                // Transfers still run; only the "stay alive in background" guarantee is lost.
-                // (Matches the old `runCatching { }` behaviour except it catches Exception
-                //  rather than Throwable - OutOfMemoryError etc. will now propagate, which
-                //  is what you want anyway.)
+                // Not allowed to start a foreground service right now - transfers still run, just
+                // without the background guarantee.
             }
         },
         onResultNotification = { task -> TransferNotifier.notifyResult(context, task) },
+        isOnline = { NetworkStatus.isOnline(context) },
     )
     private val globalLimit = Semaphore(MAX_CONCURRENT)
     private val repoLocks = ConcurrentHashMap<Long, Mutex>()
@@ -212,6 +210,13 @@ class TransferManager(
             finish(id, spec, TransferState.CANCELLED, "Cancelled")
             return GitResult.Error("Cancelled")
         }
+        // No network at all: say so immediately instead of letting JGit grind through connection
+        // attempts and then report a cryptic "cannot open git-upload-pack".
+        if (!isOnline()) {
+            runCatching { spec.cleanup?.invoke() }
+            finish(id, spec, TransferState.FAILED, GitErrors.OFFLINE_MESSAGE)
+            return GitResult.Error(GitErrors.OFFLINE_MESSAGE)
+        }
         update(id) { it.copy(state = TransferState.RUNNING, startedAt = System.currentTimeMillis()) }
 
         val reporter = TransferReporter(this, id, control.cancelRequested)
@@ -222,7 +227,7 @@ class TransferManager(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            GitResult.Error(e.message ?: e.javaClass.simpleName, e)
+            GitResult.Error(GitErrors.friendly(e), e)
         } finally {
             sampler?.cancel()
         }

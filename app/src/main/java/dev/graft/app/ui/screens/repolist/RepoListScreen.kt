@@ -39,6 +39,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.graft.app.data.RepoStorage
+import dev.graft.app.git.GitErrors
 import dev.graft.app.transfer.statusLine
 import dev.graft.app.ui.components.TransferProgressBar
 import dev.graft.app.transfer.TransferTask
@@ -235,6 +236,7 @@ fun RepoListScreen(
                                 onRequestPullForce = { repoPendingPullForce = repo },
                                 onRequestPushForce = { repoPendingPushForce = repo },
                                 onSetCredential = { repoPendingCredential = repo },
+                                onDismissError = { vm.dismissError(repo) },
                                 // Springy placement: repos entering, leaving or reordering settle into
                                 // place with a little bounce instead of snapping.
                                 itemModifier = Modifier.animateItem(
@@ -506,6 +508,7 @@ private fun RepoCard(
     onPull: () -> Unit, onPush: () -> Unit,
     onFetch: () -> Unit, onRequestPullForce: () -> Unit, onRequestPushForce: () -> Unit,
     onSetCredential: () -> Unit,
+    onDismissError: () -> Unit,
     itemModifier: Modifier = Modifier,
 ) {
     var showMore by remember { mutableStateOf(false) }
@@ -514,7 +517,8 @@ private fun RepoCard(
     // The exact wording JGit throws for a private/auth-needed remote with no credential
     // attached — recognizing it means the error banner can offer the actual fix (attach a
     // credential) instead of just showing raw exception text someone has to go interpret.
-    val needsCredential = hasError && repo.lastError.contains("no CredentialsProvider", ignoreCase = true)
+    val needsCredential = hasError && !hasCredential &&
+        GitErrors.classifyText(repo.lastError) == GitErrors.Kind.AUTH
     val accent = when {
         hasError -> MaterialTheme.colorScheme.error
         changeCount != null && changeCount > 0 -> MaterialTheme.colorScheme.secondary
@@ -588,18 +592,25 @@ private fun RepoCard(
 
             if (hasError) {
                 Spacer(Modifier.height(8.dp))
-                Text(repo.lastError, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
-                if (needsCredential) {
-                    Spacer(Modifier.height(4.dp))
-                    TextButton(
-                        onClick = onSetCredential,
-                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                        modifier = Modifier.height(28.dp),
-                    ) {
-                        Icon(Icons.Filled.Key, null, Modifier.size(14.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Attach a credential", style = MaterialTheme.typography.labelSmall)
+                Text(repo.lastError, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 3)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (needsCredential) {
+                        TextButton(
+                            onClick = onSetCredential,
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                            modifier = Modifier.height(32.dp),
+                        ) {
+                            Icon(Icons.Filled.Key, null, Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Attach a credential", style = MaterialTheme.typography.labelMedium)
+                        }
                     }
+                    // An error you've read shouldn't have to wait for a lucky success to go away.
+                    TextButton(
+                        onClick = onDismissError,
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp),
+                    ) { Text("Dismiss", style = MaterialTheme.typography.labelMedium) }
                 }
             }
 

@@ -1,5 +1,23 @@
 package dev.graft.app.ui.screens.editor
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import dev.graft.app.data.AppearancePrefs
+import dev.graft.app.ui.components.ScreenTopBar
+import dev.graft.app.ui.screens.explorer.ExtensionBadge
+import dev.graft.app.ui.theme.code
 import android.app.Application
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -175,17 +193,38 @@ class FileEditorViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    fun save() {
+    /** Runs a line tool (duplicate, indent, comment...) as ONE undo step. */
+    fun applyEdit(transform: (TextFieldValue) -> TextFieldValue) {
+        val current = _uiState.value.text
+        val result = transform(current)
+        if (result.text == current.text) {
+            _uiState.value = _uiState.value.copy(text = result)   // selection-only change
+        } else {
+            commitDiscreteEdit(result)
+        }
+    }
+
+    /** @param onSaved runs only if the write succeeded (used by "Save & close"). */
+    fun save(onSaved: (() -> Unit)? = null) {
         val repo = _uiState.value.repo ?: return
         val relativePath = _uiState.value.relativePath
         val content = _uiState.value.text.text
 
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isSaving = true)
-            withContext(Dispatchers.IO) {
-                File(repo.fullSavePath, relativePath).writeText(content)
+            val result = runCatching {
+                withContext(Dispatchers.IO) { File(repo.fullSavePath, relativePath).writeText(content) }
             }
-            _uiState.value = _uiState.value.copy(isSaving = false, isDirty = false, message = "Saved")
+            if (result.isSuccess) {
+                _uiState.value = _uiState.value.copy(isSaving = false, isDirty = false, message = "Saved")
+                onSaved?.invoke()
+            } else {
+                // Disk full, file became read-only, folder deleted underneath us... don't crash the editor.
+                _uiState.value = _uiState.value.copy(
+                    isSaving = false,
+                    message = "Couldn't save: ${result.exceptionOrNull()?.message ?: "unknown error"}",
+                )
+            }
         }
     }
 
@@ -400,65 +439,130 @@ fun FileEditorScreen(
         scrollToLine(line)
     }
 
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val wordWrap by AppearancePrefs.editorWordWrap.collectAsState()
+    val showLineNumbers by AppearancePrefs.editorLineNumbers.collectAsState()
+    val textSize by AppearancePrefs.editorTextSize.collectAsState()
+    val widthDp = LocalConfiguration.current.screenWidthDp
+    // Three layouts: a phone (everything non-essential in the overflow so the filename gets room),
+    // a large phone / small tablet (find joins the bar), and a tablet (push too, Markdown goes split).
+    val wide = widthDp >= 600
+    val inlineFind = widthDp >= 420
+    val canEdit = !state.isBinaryOrTooLarge && !state.isLoading
+    val commentPrefix = remember(language) { lineCommentPrefix(language) }
+    val fileName = relativePath.substringAfterLast('/')
+    var showDiscard by remember { mutableStateOf(false) }
+    val lineTotal = remember(state.text.text) { state.text.text.count { it == '\n' } + 1 }
+
+    // Leaving with unsaved edits asks first - the system back gesture, the arrow, all the same.
+    BackHandler(enabled = state.isDirty) { showDiscard = true }
+    val requestBack: () -> Unit = {
+        if (state.isDirty) {
+            showDiscard = true
+        } else {
+            onBack()
+        }
+    }
+
+    val sizes = AppearancePrefs.EditorTextSize.values()
+
     Scaffold(
+        modifier = Modifier.onPreviewKeyEvent { e ->
+            // Hardware-keyboard shortcuts (Chromebooks, tablets with a keyboard, Samsung DeX).
+            if (canEdit && e.type == KeyEventType.KeyDown && (e.isCtrlPressed || e.isMetaPressed)) {
+                when (e.key) {
+                    Key.S -> { if (state.isDirty) vm.save(); true }
+                    Key.F -> { showFind = true; true }
+                    Key.G -> { showGoToLine = true; true }
+                    Key.D -> { vm.applyEdit(::duplicateLine); true }
+                    Key.Z -> { if (e.isShiftPressed) vm.redo() else vm.undo(); true }
+                    Key.Y -> { vm.redo(); true }
+                    Key.Slash -> { commentPrefix?.let { p -> vm.applyEdit { toggleLineComment(it, p) } }; true }
+                    else -> false
+                }
+            } else false
+        },
         topBar = {
             Column {
-                TopAppBar(
-                    title = {
+                ScreenTopBar(
+                    onBack = { requestBack() },
+                    titleContent = {
                         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                            if (!state.isBinaryOrTooLarge && !state.isLoading) {
-                                val (icon, tint) = dev.graft.app.ui.screens.explorer.fileIconFor(relativePath)
-                                Icon(icon, null, Modifier.size(18.dp), tint = tint)
-                                Spacer(Modifier.width(8.dp))
+                            if (canEdit) {
+                                ExtensionBadge(fileName)
+                                Spacer(Modifier.width(10.dp))
                             }
                             Column {
                                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                    Text(relativePath.substringAfterLast('/'), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                    Text(
+                                        fileName,
+                                        style = MaterialTheme.typography.titleMedium.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
+                                    )
                                     if (state.isDirty) {
-                                        Spacer(Modifier.width(6.dp))
-                                        Box(Modifier.size(6.dp).background(MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape))
+                                        Spacer(Modifier.width(8.dp))
+                                        Box(Modifier.size(8.dp).background(MaterialTheme.colorScheme.secondary, androidx.compose.foundation.shape.CircleShape))
                                     }
                                 }
-                                if (!state.isBinaryOrTooLarge && !state.isLoading) {
-                                    Text(
-                                        "${languageLabel(language)} · Ln $currentLine, Col $currentCol",
-                                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
+                                val folder = relativePath.substringBeforeLast('/', missingDelimiterValue = "")
+                                Text(
+                                    if (folder.isEmpty()) "repository root" else folder,
+                                    style = MaterialTheme.code.tiny,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                )
                             }
                         }
                     },
-                    navigationIcon = {
-                        IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-                    },
                     actions = {
-                        if (!state.isBinaryOrTooLarge && !state.isLoading) {
-                            IconButton(onClick = { showFind = true }) { Icon(Icons.Filled.Search, "Find in file") }
-                            IconButton(onClick = vm::undo, enabled = state.canUndo) {
-                                Icon(Icons.AutoMirrored.Filled.Undo, "Undo")
+                        if (canEdit) {
+                            if (inlineFind) {
+                                IconButton(onClick = { showFind = true }) { Icon(Icons.Filled.Search, "Find in file") }
                             }
-                            IconButton(onClick = vm::redo, enabled = state.canRedo) {
-                                Icon(Icons.AutoMirrored.Filled.Redo, "Redo")
-                            }
-                            if (isMarkdown) {
-                                IconButton(onClick = vm::togglePreview) {
-                                    Icon(
-                                        if (state.showPreview) Icons.Filled.Edit else Icons.Filled.Visibility,
-                                        if (state.showPreview) "Edit" else "Preview",
-                                        tint = if (state.showPreview) MaterialTheme.colorScheme.primary else LocalContentColor.current,
-                                    )
+                            IconButton(onClick = vm::undo, enabled = state.canUndo) { Icon(Icons.AutoMirrored.Filled.Undo, "Undo") }
+                            IconButton(onClick = vm::redo, enabled = state.canRedo) { Icon(Icons.AutoMirrored.Filled.Redo, "Redo") }
+                            if (wide) {
+                                IconButton(onClick = { showPushDialog = true }, enabled = !state.isSaving) {
+                                    Icon(Icons.Filled.ArrowUpward, "Save, commit & push")
                                 }
                             }
-                            IconButton(onClick = vm::save, enabled = state.isDirty && !state.isSaving) {
+                            IconButton(onClick = { vm.save() }, enabled = state.isDirty && !state.isSaving) {
                                 if (state.isSaving) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                                else Icon(Icons.Filled.Save, "Save")
-                            }
-                            IconButton(onClick = { showPushDialog = true }, enabled = !state.isSaving) {
-                                Icon(Icons.Filled.ArrowUpward, "Save, commit & push")
+                                else Icon(
+                                    Icons.Filled.Save, "Save",
+                                    tint = if (state.isDirty) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                                )
                             }
                             Box {
                                 IconButton(onClick = { showOverflow = true }) { Icon(Icons.Filled.MoreVert, "More") }
                                 DropdownMenu(expanded = showOverflow, onDismissRequest = { showOverflow = false }) {
+                                    if (!wide) {
+                                        DropdownMenuItem(
+                                            text = { Text("Save, commit & push…") },
+                                            leadingIcon = { Icon(Icons.Filled.ArrowUpward, null) },
+                                            enabled = !state.isSaving,
+                                            onClick = { showOverflow = false; showPushDialog = true },
+                                        )
+                                    }
+                                    if (!inlineFind) {
+                                        DropdownMenuItem(
+                                            text = { Text("Find & replace") },
+                                            leadingIcon = { Icon(Icons.Filled.Search, null) },
+                                            onClick = { showOverflow = false; showFind = true },
+                                        )
+                                    }
+                                    if (isMarkdown && !wide) {
+                                        DropdownMenuItem(
+                                            text = { Text(if (state.showPreview) "Edit" else "Preview") },
+                                            leadingIcon = { Icon(if (state.showPreview) Icons.Filled.Edit else Icons.Filled.Visibility, null) },
+                                            onClick = { showOverflow = false; vm.togglePreview() },
+                                        )
+                                    }
+                                    HorizontalDivider()
                                     DropdownMenuItem(
                                         text = { Text("Go to line…") },
                                         leadingIcon = { Icon(Icons.Filled.MyLocation, null) },
@@ -468,6 +572,62 @@ fun FileEditorScreen(
                                         text = { Text("Select all") },
                                         leadingIcon = { Icon(Icons.Filled.SelectAll, null) },
                                         onClick = { showOverflow = false; vm.selectAll() },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Copy all") },
+                                        leadingIcon = { Icon(Icons.Filled.ContentCopy, null) },
+                                        onClick = {
+                                            showOverflow = false
+                                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(state.text.text))
+                                            coroutineScope.launch { snack.showSnackbar("Copied $lineTotal lines") }
+                                        },
+                                    )
+                                    HorizontalDivider()
+                                    DropdownMenuItem(
+                                        text = { Text("Duplicate line") },
+                                        leadingIcon = { Icon(Icons.Filled.ContentCopy, null) },
+                                        onClick = { showOverflow = false; vm.applyEdit(::duplicateLine) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Delete line") },
+                                        leadingIcon = { Icon(Icons.Filled.Delete, null) },
+                                        onClick = { showOverflow = false; vm.applyEdit(::deleteLine) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Indent") },
+                                        onClick = { showOverflow = false; vm.applyEdit(::indentLines) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Outdent") },
+                                        onClick = { showOverflow = false; vm.applyEdit(::outdentLines) },
+                                    )
+                                    if (commentPrefix != null) {
+                                        DropdownMenuItem(
+                                            text = { Text("Toggle comment") },
+                                            onClick = { showOverflow = false; vm.applyEdit { toggleLineComment(it, commentPrefix) } },
+                                        )
+                                    }
+                                    HorizontalDivider()
+                                    DropdownMenuItem(
+                                        text = { Text("Word wrap") },
+                                        trailingIcon = { Checkbox(checked = wordWrap, onCheckedChange = null) },
+                                        onClick = { AppearancePrefs.setEditorWordWrap(context, !wordWrap) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Line numbers") },
+                                        trailingIcon = { Checkbox(checked = showLineNumbers && !wordWrap, onCheckedChange = null) },
+                                        enabled = !wordWrap,
+                                        onClick = { AppearancePrefs.setEditorLineNumbers(context, !showLineNumbers) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Larger text") },
+                                        enabled = textSize.ordinal < sizes.lastIndex,
+                                        onClick = { AppearancePrefs.setEditorTextSize(context, sizes[textSize.ordinal + 1]) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Smaller text") },
+                                        enabled = textSize.ordinal > 0,
+                                        onClick = { AppearancePrefs.setEditorTextSize(context, sizes[textSize.ordinal - 1]) },
                                     )
                                 }
                             }
@@ -493,6 +653,25 @@ fun FileEditorScreen(
         },
         snackbarHost = { SnackbarHost(snack) { d -> Snackbar(d) } },
     ) { pad ->
+        val editor: @Composable () -> Unit = {
+            CodeEditorField(
+                value = state.text,
+                onValueChange = vm::onTextChanged,
+                language = language,
+                verticalScrollState = editorScrollState,
+                wordWrap = wordWrap,
+                showLineNumbers = showLineNumbers,
+                modifier = Modifier.fillMaxSize().imePadding(),
+                status = {
+                    EditorStatusBar(
+                        line = currentLine, col = currentCol,
+                        selected = state.text.selection.length,
+                        lines = lineTotal, chars = state.text.text.length,
+                        language = languageLabel(language), wrap = wordWrap,
+                    )
+                },
+            )
+        }
         Box(Modifier.fillMaxSize().padding(pad)) {
             when {
                 state.isLoading -> CircularProgressIndicator(Modifier.align(androidx.compose.ui.Alignment.Center))
@@ -509,16 +688,33 @@ fun FileEditorScreen(
                         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                // Room for both: edit on the left, live-rendered preview on the right.
+                isMarkdown && wide -> Row(Modifier.fillMaxSize()) {
+                    Box(Modifier.weight(1f).fillMaxHeight()) { editor() }
+                    VerticalDivider()
+                    MarkdownPreview(state.text.text, Modifier.weight(1f).fillMaxHeight())
+                }
                 isMarkdown && state.showPreview -> MarkdownPreview(state.text.text, Modifier.fillMaxSize())
-                else -> CodeEditorField(
-                    value = state.text,
-                    onValueChange = vm::onTextChanged,
-                    language = language,
-                    verticalScrollState = editorScrollState,
-                    modifier = Modifier.fillMaxSize().imePadding(),
-                )
+                else -> editor()
             }
         }
+    }
+
+    if (showDiscard) {
+        AlertDialog(
+            onDismissRequest = { showDiscard = false },
+            title = { Text("Unsaved changes") },
+            text = { Text("Save your changes to $fileName before leaving?") },
+            confirmButton = { TextButton(onClick = { showDiscard = false; vm.save(onSaved = onBack) }) { Text("Save") } },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { showDiscard = false; onBack() }) {
+                        Text("Discard", color = MaterialTheme.colorScheme.error)
+                    }
+                    TextButton(onClick = { showDiscard = false }) { Text("Keep editing") }
+                }
+            },
+        )
     }
 
     if (showGoToLine) {
@@ -644,5 +840,35 @@ private fun FindBar(
                 }
             }
         }
+    }
+}
+
+
+/** One thin line under the text: where the caret is, how big the file is, what language it's read as. */
+@Composable
+private fun EditorStatusBar(
+    line: Int, col: Int, selected: Int, lines: Int, chars: Int, language: String, wrap: Boolean,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow)
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+    ) {
+        Text(
+            "Ln $line, Col $col" + if (selected > 0) "  ($selected selected)" else "",
+            style = MaterialTheme.code.tiny,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+        )
+        Spacer(Modifier.weight(1f))
+        Text(
+            "$lines lines · $chars chars · UTF-8 · $language" + if (wrap) " · wrap" else "",
+            style = MaterialTheme.code.tiny,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+        )
     }
 }

@@ -5,7 +5,12 @@ import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -95,6 +100,12 @@ fun CodeEditorField(
     language: CodeLanguage,
     verticalScrollState: ScrollState,
     modifier: Modifier = Modifier,
+    /** Wrap long lines instead of scrolling sideways. The gutter is hidden then: one number per
+     *  *logical* line can't line up with wrapped visual rows. */
+    wordWrap: Boolean = false,
+    showLineNumbers: Boolean = true,
+    /** Slot between the text and the symbol bar - the screen puts its Ln/Col status line here. */
+    status: (@Composable () -> Unit)? = null,
 ) {
     val syntaxColors = MaterialTheme.gitColors.syntax
     val fontSize = currentEditorFontSize()
@@ -139,7 +150,7 @@ fun CodeEditorField(
             // Column had to synchronously compose and measure every single line number up
             // front, even ones nowhere near the visible viewport.
             val gutterText = remember(lineCount) { (1..lineCount).joinToString("\n") }
-            Text(
+            if (showLineNumbers && !wordWrap) Text(
                 text = gutterText,
                 style = codeTextStyle.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
                 textAlign = TextAlign.End,
@@ -152,10 +163,11 @@ fun CodeEditorField(
 
             BasicTextField(
                 value = value,
-                onValueChange = onValueChange,
+                // Enter carries the indentation forward (and opens `{ }` blocks) - see autoIndentOnEnter.
+                onValueChange = { new -> onValueChange(autoIndentOnEnter(value, new)) },
                 modifier = Modifier
                     .weight(1f)
-                    .horizontalScroll(horizontalScrollState)
+                    .then(if (wordWrap) Modifier else Modifier.horizontalScroll(horizontalScrollState))
                     .padding(12.dp),
                 textStyle = codeTextStyle,
                 visualTransformation = remember(highlighted) { CachedHighlightTransformation(highlighted) },
@@ -168,37 +180,49 @@ fun CodeEditorField(
         }
 
         HorizontalDivider()
+        status?.invoke()
         QuickSymbolToolbar(
             onInsert = { symbol -> onValueChange(insertAtCursor(value, symbol)) },
+            onMove = { delta -> onValueChange(moveCursor(value, delta)) },
         )
     }
 }
 
 @Composable
-private fun QuickSymbolToolbar(onInsert: (String) -> Unit) {
+private fun QuickSymbolToolbar(onInsert: (String) -> Unit, onMove: (Int) -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
-            .height(40.dp)
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .horizontalScroll(rememberScrollState()),
+            .height(44.dp)
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        // Cursor keys first: on a touch keyboard nudging the caret by one character is the
+        // hardest thing to do precisely, and the thing you do most after typing a symbol.
+        QuickKey("◀", MaterialTheme.colorScheme.primary) { onMove(-1) }
+        QuickKey("▶", MaterialTheme.colorScheme.primary) { onMove(1) }
         QuickSymbols.forEach { (label, insertText) ->
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .width(40.dp)
-                    .clickable { onInsert(insertText) },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    label,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 15.sp,
-                    color = if (label == "→") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                )
+            QuickKey(label, if (label == "→") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface) {
+                onInsert(insertText)
             }
         }
+    }
+}
+
+@Composable
+private fun QuickKey(label: String, color: androidx.compose.ui.graphics.Color, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .fillMaxHeight()
+            .widthIn(min = 38.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, fontFamily = FontFamily.Monospace, fontSize = 15.sp, color = color)
     }
 }
 

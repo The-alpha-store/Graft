@@ -29,6 +29,7 @@ inline fun <T> gitTry(block: () -> T): GitResult<T> {
     return try {
         GitResult.Success(block())
     } catch (e: Exception) {
-        GitResult.Error(e.message ?: e.javaClass.simpleName, e)
+        // Humanised here, once, so every screen that shows an error gets the readable version.
+        GitResult.Error(GitErrors.friendly(e), e)
     }
 }

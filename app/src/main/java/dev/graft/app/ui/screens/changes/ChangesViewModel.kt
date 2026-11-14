@@ -475,4 +475,5 @@ class ChangesViewModel(app: Application) : AndroidViewModel(app) {
         if (reset is GitResult.Error) return GitResult.Error(reset.message)
         return commit(git, msg, name, email)
     }
+
 }

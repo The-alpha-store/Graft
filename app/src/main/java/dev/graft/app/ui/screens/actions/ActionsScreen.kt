@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.HourglassTop
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.RemoveCircleOutline
 import androidx.compose.material.icons.filled.GetApp
@@ -57,6 +58,10 @@ import dev.graft.app.data.github.WorkflowRun
 import dev.graft.app.data.github.WorkflowStep
 import dev.graft.app.data.github.githubFullNameFromUrl
 import dev.graft.app.ui.components.AppCard
+import dev.graft.app.ui.theme.code
+import dev.graft.app.ui.components.StatusPill
+import dev.graft.app.ui.components.EmptyState
+import dev.graft.app.ui.components.BranchChip
 import dev.graft.app.ui.components.RepoTitleBlock
 import dev.graft.app.ui.components.RefreshBox
 import dev.graft.app.ui.theme.*
@@ -312,17 +317,30 @@ fun ActionsScreen(repoId: Long, onBack: () -> Unit, vm: ActionsViewModel = viewM
 
             when {
                 state.fullName == null -> EmptyNote(
-                    "This repo's remote doesn't look like a GitHub repo, so there's no Actions data to show.",
+                    "Not a GitHub repo",
+                    "This repo's remote doesn't look like a GitHub repo, so there's no Actions data to show. You can still add workflow files from the Templates tab.",
                 )
                 !state.hasToken -> EmptyNote(
-                    "Attach a credential with a GitHub token to this repo (Credentials screen) to see its workflow runs.",
+                    "Connect your GitHub account",
+                    "Attach a credential with a GitHub token to this repo (Settings → Credentials) to see its workflow runs.",
                 )
                 state.isLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-                state.runs.isEmpty() -> EmptyNote("No workflow runs found for this repo yet.")
+                state.runs.isEmpty() -> EmptyNote("No runs yet", "Push a commit, or add a workflow from the Templates tab, and runs will show up here.")
                 else -> {
                     val context = LocalContext.current
-                    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp, horizontal = 12.dp)) {
-                        items(state.runs, key = { it.id }) { run ->
+                    var filter by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(RunFilter.ALL) }
+                    val shown = remember(state.runs, filter) { state.runs.filter { filter.matches(it) } }
+                    Column(Modifier.fillMaxSize()) {
+                        RunFilterRow(filter = filter, runs = state.runs, onSelect = { filter = it })
+                        if (shown.isEmpty()) {
+                            EmptyNote("No ${filter.label.lowercase()} runs", "Nothing in the latest runs matches this filter.")
+                        } else {
+                    LazyColumn(
+                        Modifier.weight(1f).fillMaxWidth(),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        items(shown, key = { it.id }) { run ->
                             RunCard(
                                 run = run,
                                 expanded = state.expandedRunId == run.id,
@@ -352,6 +370,8 @@ fun ActionsScreen(repoId: Long, onBack: () -> Unit, vm: ActionsViewModel = viewM
                             )
                         }
                     }
+                        }
+                    }
                 }
             }
         }
@@ -364,14 +384,10 @@ fun ActionsScreen(repoId: Long, onBack: () -> Unit, vm: ActionsViewModel = viewM
 }
 
 @Composable
-private fun EmptyNote(text: String) {
-    Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
-        Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-    }
+private fun EmptyNote(title: String, text: String) {
+    EmptyState(icon = Icons.Filled.Info, title = title, message = text)
 }
 
-/** Color for either a run's or a job's state — the same vocabulary (running/success/
- *  failure/cancelled/neutral) applies at both levels, just at different granularity. */
 @Composable
 internal fun statusColor(status: String, conclusion: String?): Color = when {
     status != "completed" -> MaterialTheme.colorScheme.secondary
@@ -460,7 +476,7 @@ private fun RunCard(
     val label = statusLabel(run.status, run.conclusion)
     val rotation by animateFloatAsState(if (expanded) 0f else -90f, label = "runChevron")
 
-    AppCard(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), accent = color) {
+    AppCard(modifier = Modifier.fillMaxWidth(), accent = color) {
         Column(Modifier.fillMaxWidth()) {
             Row(
                 Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(12.dp),
@@ -476,15 +492,20 @@ private fun RunCard(
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
                     Text(run.displayTitle, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1)
-                    Text(
-                        "${run.headBranch} · ${run.headSha.take(7)} · ${relativeTime(run.updatedAt)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                    )
+                    Spacer(Modifier.height(2.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        BranchChip(run.headBranch, Modifier.weight(1f, fill = false))
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "${run.headSha.take(7)} · ${relativeTime(run.updatedAt)}",
+                            style = MaterialTheme.code.tiny,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
                 }
                 Spacer(Modifier.width(8.dp))
-                Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                StatusPill(label, color, color.copy(alpha = 0.14f))
                 if (run.htmlUrl.isNotBlank()) {
                     val context = LocalContext.current
                     IconButton(onClick = { openUrl(context, run.htmlUrl) }, modifier = Modifier.size(28.dp)) {
@@ -693,6 +714,38 @@ private fun LogPanel(log: String?, loading: Boolean) {
                 Spacer(Modifier.height(6.dp))
                 TextButton(onClick = { clipboard.setText(AnnotatedString(log)) }) { Text("Copy full log") }
             }
+        }
+    }
+}
+
+
+private val FAILED_CONCLUSIONS = setOf("failure", "timed_out", "startup_failure", "action_required")
+
+private enum class RunFilter(val label: String) {
+    ALL("All"), RUNNING("Running"), FAILED("Failed"), PASSED("Passed");
+
+    fun matches(run: WorkflowRun): Boolean = when (this) {
+        ALL -> true
+        RUNNING -> run.isActive
+        FAILED -> run.conclusion in FAILED_CONCLUSIONS
+        PASSED -> run.conclusion == "success"
+    }
+}
+
+/** Filter chips with live counts, so "3 failed" is visible before you tap anything. */
+@Composable
+private fun RunFilterRow(filter: RunFilter, runs: List<WorkflowRun>, onSelect: (RunFilter) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        RunFilter.values().forEach { f ->
+            val count = if (f == RunFilter.ALL) 0 else runs.count { f.matches(it) }
+            FilterChip(
+                selected = filter == f,
+                onClick = { onSelect(f) },
+                label = { Text(if (count > 0) "${f.label} $count" else f.label) },
+            )
         }
     }
 }

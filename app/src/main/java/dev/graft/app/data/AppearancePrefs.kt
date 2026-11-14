@@ -46,6 +46,13 @@ object AppearancePrefs {
     private val _editorTextSize = MutableStateFlow(EditorTextSize.DEFAULT)
     val editorTextSize: StateFlow<EditorTextSize> = _editorTextSize
 
+    /** Wrap long lines in the code editor (hides the line-number gutter, which can't track wrapped rows). */
+    private val _editorWordWrap = MutableStateFlow(false)
+    val editorWordWrap: StateFlow<Boolean> = _editorWordWrap
+
+    private val _editorLineNumbers = MutableStateFlow(true)
+    val editorLineNumbers: StateFlow<Boolean> = _editorLineNumbers
+
     fun init(context: Context) {
         if (::prefs.isInitialized) return
         prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -56,6 +63,8 @@ object AppearancePrefs {
             presetId = prefs.getString("accent_preset", null) ?: AccentPalettes.Command.id,
             customHex = prefs.getString("accent_custom_hex", null),
         )
+        _editorWordWrap.value = prefs.getBoolean("editor_word_wrap", false)
+        _editorLineNumbers.value = prefs.getBoolean("editor_line_numbers", true)
         _editorTextSize.value = runCatching { EditorTextSize.valueOf(prefs.getString("editor_text_size", null) ?: "") }
             .getOrDefault(EditorTextSize.DEFAULT)
     }
@@ -85,6 +94,18 @@ object AppearancePrefs {
         prefs.edit().putString("accent_preset", AccentPalettes.CUSTOM_ID).putString("accent_custom_hex", hex).apply()
         _accent.value = AccentChoice(presetId = AccentPalettes.CUSTOM_ID, customHex = hex)
         return true
+    }
+
+    fun setEditorWordWrap(context: Context, enabled: Boolean) {
+        init(context)
+        prefs.edit().putBoolean("editor_word_wrap", enabled).apply()
+        _editorWordWrap.value = enabled
+    }
+
+    fun setEditorLineNumbers(context: Context, enabled: Boolean) {
+        init(context)
+        prefs.edit().putBoolean("editor_line_numbers", enabled).apply()
+        _editorLineNumbers.value = enabled
     }
 
     fun setEditorTextSize(context: Context, size: EditorTextSize) {

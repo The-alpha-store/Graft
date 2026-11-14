@@ -90,11 +90,30 @@ What changed, and why it should help (structural reasoning - not benchmarked on 
   **background sync** skips tags. Network calls have a 45 s *inactivity* timeout so a stalled
   connection fails instead of hanging.
 
-## Files tab
+## Files tab & editor
 
-Everything from the reference's explorer/editor, plus: **Find file by name** (whole repo), **Properties**
-(size - recursive for folders - modified time, location, git status), **Copy path**, and **Find &
-Replace** with match-case in the editor (one undo step for "Replace all").
+The Files tab follows the original app's look: each file is an **inset rounded card** (indented by depth)
+with a coloured **extension badge** (`KT`, `YML`, `MD`...), amber folders, size under the name, a quick-edit
+button and a ⋮ menu, under a pinned header with **.gitignore**, **CI Actions** and **Find file**. Also:
+whole-repo filename search, Properties, Copy path.
+
+The editor (responsive: phone / large phone / tablet layouts so the filename always fits):
+- **Find & replace** (match case, one undo step for *Replace all*), **go to line**, select all, copy all
+- **Line tools**: duplicate, delete, indent, outdent, **toggle comment** (`//` or `#` by language)
+- **Auto-indent** on Enter (extra level after `{ ( [ :`, and `{|}` opens a block)
+- Word wrap, line-number toggle, text size, a status bar (Ln/Col, selection, size, language)
+- Quick-symbol bar with **◀ ▶ cursor keys**; **side-by-side Markdown** preview on wide screens
+- **Unsaved-changes guard** (Save / Discard / Keep editing), robust save, hardware shortcuts
+  (Ctrl+S, F, G, D, Z/Y, /)
+
+## Errors
+
+Raw JGit exceptions are translated into plain language (`GitErrors`), classifying by the whole cause chain
+(so `cannot open git-upload-pack` caused by an `UnknownHostException` reads as "you're offline").
+Transient failures - no connection, dropped connection, timeout, server hiccup - are **never stored** as a
+repo's error; they show once, as a message and a retryable row in Transfers. Only actionable failures (bad
+credentials, rejected push) stay on a card, with **Dismiss**. Offline is detected up front so a transfer fails
+instantly instead of hanging. Stale network errors saved by older builds are cleared at launch.
 
 ## Storage
 

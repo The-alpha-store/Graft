@@ -34,6 +34,9 @@ interface RepoDao {
     @Query("UPDATE repos SET lastError = :error WHERE id = :id")
     suspend fun markError(id: Long, error: String)
 
+    @Query("UPDATE repos SET lastError = '' WHERE id = :id")
+    suspend fun clearError(id: Long)
+
     @Query("UPDATE repos SET branch = :branch WHERE id = :id")
     suspend fun updateBranch(id: Long, branch: String)
 

@@ -96,6 +96,20 @@ edits to `RepoListScreen`, `SettingsScreen`, `CloneScreen`/`CloneViewModel`).
 - **Files tab**: filename search, properties, copy path, find & replace. The base's tree is *not*
   ported - the reference explorer already had a superset (multi-select, import, compact folders, sort).
 
+### Round 3: errors, editor, console, actions, Files design
+
+- **Sticky errors fixed** (see screenshot: every repo red with `cannot open git-upload-pack` / `connection
+  abort`): `GitErrors` classifies + humanises; `RepoRepository.markError` refuses transient failures;
+  `clearTransientErrors()` runs at startup; `TransferManager` fails fast when offline.
+- **Files tab restyled** to the original: inset card rows, extension badges, action header.
+- **Editor**: see README. New pure `EditorText.kt` (unit-tested) + responsive `FileEditorScreen`.
+- **Console**: shared top bar, one-tap quick commands (read-only ones run, mutating ones only fill the
+  input), selectable output, copy transcript, proper empty state.
+- **Actions**: filter chips with counts, status pills, monospace branch/SHA, real empty states.
+- **Bug found by CI, fixed**: a constructor-argument `runCatching {}` resolving to `T.runCatching` on an
+  uninitialised `this`; `conflate()` on a `StateFlow`; a duplicate `onCleared`; a top-level `val` reading
+  `MaterialTheme`. The verifier now also checks icon imports.
+
 ### Known limits
 
 - Nothing here has been run or benchmarked; speed claims are from removing redundant work, not stopwatch

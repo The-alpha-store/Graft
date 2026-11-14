@@ -191,6 +191,8 @@ fun AppNavHost(nav: NavHostController) {
                     onOpenFile = { filePath -> nav.navigate(Routes.editor(id, filePath)) },
                     onOpenBlame = { filePath -> nav.navigate(Routes.blame(id, filePath)) },
                     onOpenSearch = { nav.navigate(Routes.search(id)) },
+                    onOpenGitignore = { nav.navigate(Routes.gitignore(id)) },
+                    onOpenActions = { nav.navigate(Routes.actions(id)) },
                     vm = viewModel(owner),
                 )
             }
