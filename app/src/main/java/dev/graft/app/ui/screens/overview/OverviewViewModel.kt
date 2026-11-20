@@ -5,6 +5,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.graft.app.App
 import dev.graft.app.data.RepoStatusStore
+import java.io.File
+import dev.graft.app.transfer.awaitResult
+import dev.graft.app.transfer.TransferKind
 import dev.graft.app.data.db.entity.RepoEntity
 import dev.graft.app.data.db.entity.SyncLogEntity
 import dev.graft.app.git.CommitInfo
@@ -30,6 +33,8 @@ data class OverviewUiState(
     val syncEvents: List<SyncLogEntity> = emptyList(),
     val isLoading: Boolean = true,
     val error: String? = null,
+    /** One-shot result of the last fetch/pull/push, shown as a snackbar. */
+    val message: String? = null,
 )
 
 /**
@@ -41,6 +46,7 @@ class OverviewViewModel(app: Application) : AndroidViewModel(app) {
     private val appRef = app as App
     private val repoRepo = appRef.repoRepository
     private val syncLogs = appRef.syncLogRepository
+    private val credRepo = appRef.credentialRepository
 
     private val _state = MutableStateFlow(OverviewUiState())
     val uiState: StateFlow<OverviewUiState> = _state.asStateFlow()
@@ -58,6 +64,48 @@ class OverviewViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         refresh()
+    }
+
+    fun dismissMessage() { _state.update { it.copy(message = null) } }
+
+    /**
+     * Fetch / pull / push as a background transfer (progress here, in the banner and in Transfers),
+     * then report the outcome and refresh the numbers on this screen.
+     */
+    fun runTransfer(kind: TransferKind) {
+        val repo = _state.value.repo ?: return
+        viewModelScope.launch {
+            val cred = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
+            val manager = appRef.transferManager
+            val outcome = manager.enqueue(
+                kind = kind, repoId = repo.id, title = repo.name, watchDir = File(repo.fullSavePath),
+            ) { reporter ->
+                manager.withGit(repo.fullSavePath) { git ->
+                    when (kind) {
+                        TransferKind.PULL -> GitEngine.pullMerge(git, cred, reporter.monitor)
+                        TransferKind.PUSH -> GitEngine.push(git, credential = cred, monitor = reporter.monitor)
+                        else -> GitEngine.fetch(git, credential = cred, monitor = reporter.monitor)
+                    }
+                }
+            }.awaitResult()
+
+            when (outcome) {
+                is GitResult.Success -> {
+                    repoRepo.markSyncSuccess(repo.id)
+                    val detail = (outcome.data as? String)?.takeIf { it.isNotBlank() } ?: "Done"
+                    _state.update { it.copy(message = "${kind.label}: $detail") }
+                }
+                is GitResult.Error -> {
+                    if (outcome.message == "Cancelled") {
+                        _state.update { it.copy(message = "${kind.label} cancelled") }
+                    } else {
+                        repoRepo.markError(repo.id, outcome.message)
+                        _state.update { it.copy(message = outcome.message) }
+                    }
+                }
+            }
+            refresh()
+        }
     }
 
     fun refresh() {

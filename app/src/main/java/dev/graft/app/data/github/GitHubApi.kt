@@ -1,5 +1,6 @@
 package dev.graft.app.data.github
 
+import dev.graft.app.git.GitErrors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -17,6 +18,30 @@ data class GitHubRepoSummary(
     val defaultBranch: String,
     val private: Boolean,
 )
+
+/** A pull request as shown in the list. [merged] is derived from `merged_at` (the list endpoint has no
+ *  `merged` flag), so a merged PR - which GitHub reports as state "closed" - is told apart from a
+ *  rejected one. */
+data class PullRequest(
+    val number: Int,
+    val title: String,
+    val author: String,
+    val state: String,
+    val draft: Boolean,
+    val merged: Boolean,
+    val headBranch: String,
+    val baseBranch: String,
+    val htmlUrl: String,
+    val updatedAt: String,
+) {
+    val label: String
+        get() = when {
+            merged -> "Merged"
+            state == "open" && draft -> "Draft"
+            state == "open" -> "Open"
+            else -> "Closed"
+        }
+}
 
 /** One Actions run — a single execution of a workflow, triggered by a push, a PR, a manual
  *  dispatch, etc. [status] is the lifecycle state ("queued"/"in_progress"/"completed"/
@@ -177,6 +202,33 @@ object GitHubApi {
             }
         }
     }
+
+    /** Pull requests, most recently updated first (open, merged and closed together). */
+    suspend fun listPullRequests(fullName: String, token: String, perPage: Int = 40): GitHubResult<List<PullRequest>> {
+        val url = "$BASE/repos/$fullName/pulls?state=all&sort=updated&direction=desc&per_page=$perPage"
+        return when (val r = http(url, "GET", token)) {
+            is GitHubResult.Error -> r
+            is GitHubResult.Success -> try {
+                val arr = JSONArray(r.data)
+                GitHubResult.Success((0 until arr.length()).map { parsePullRequest(arr.getJSONObject(it)) })
+            } catch (e: Exception) {
+                GitHubResult.Error("Couldn't read GitHub's response: ${e.message}")
+            }
+        }
+    }
+
+    private fun parsePullRequest(o: JSONObject): PullRequest = PullRequest(
+        number = o.getInt("number"),
+        title = o.optString("title", ""),
+        author = o.optJSONObject("user")?.optString("login").orEmpty(),
+        state = o.optString("state", "open"),
+        draft = o.optBoolean("draft", false),
+        merged = !o.isNull("merged_at"),
+        headBranch = o.optJSONObject("head")?.optString("ref").orEmpty(),
+        baseBranch = o.optJSONObject("base")?.optString("ref").orEmpty(),
+        htmlUrl = o.optString("html_url", ""),
+        updatedAt = o.optString("updated_at", ""),
+    )
 
     /** Runs triggered by one specific commit — used to show "did my last push's build pass?"
      *  right on the Changes screen without opening the full Actions list. */
@@ -422,7 +474,7 @@ object GitHubApi {
                     GitHubResult.Success(body)
                 }
             } catch (e: Exception) {
-                GitHubResult.Error(e.message ?: "Network error reaching GitHub")
+                GitHubResult.Error(GitErrors.friendly(e))
             } finally {
                 conn?.disconnect()
             }

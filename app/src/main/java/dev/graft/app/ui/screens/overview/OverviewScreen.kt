@@ -23,6 +23,18 @@ import androidx.compose.material.icons.filled.MergeType
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.Button
+import dev.graft.app.ui.components.TransferProgressBar
+import dev.graft.app.transfer.statusLine
+import dev.graft.app.transfer.TransferTask
+import dev.graft.app.transfer.TransferState
+import dev.graft.app.transfer.TransferKind
+import dev.graft.app.App
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.remember
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -77,6 +89,12 @@ fun OverviewScreen(
     vm: OverviewViewModel = viewModel(),
 ) {
     val state by vm.uiState.collectAsState()
+    val appContext = LocalContext.current.applicationContext
+    val transferManager = remember { (appContext as App).transferManager }
+    val transfers by transferManager.tasks.collectAsState()
+    val activeTransfer = transfers.firstOrNull { it.repoId == repoId && it.state.isActive }
+    val snack = remember { SnackbarHostState() }
+    LaunchedEffect(state.message) { state.message?.let { snack.showSnackbar(it); vm.dismissMessage() } }
 
     LaunchedEffect(repoId) { vm.load(repoId) }
 
@@ -97,6 +115,7 @@ fun OverviewScreen(
                 onBack = onBack,
             )
         },
+        snackbarHost = { SnackbarHost(snack) },
     ) { pad ->
         val repo = state.repo
         when {
@@ -119,6 +138,16 @@ fun OverviewScreen(
                             state = state,
                             onReview = onOpenChanges,
                             onResolve = onOpenConflicts,
+                        )
+                    }
+                    if (!repo.cloneUrl.isNullOrBlank()) item(key = "sync") {
+                        SyncCard(
+                            state = state,
+                            active = activeTransfer,
+                            onFetch = { vm.runTransfer(TransferKind.FETCH) },
+                            onPull = { vm.runTransfer(TransferKind.PULL) },
+                            onPush = { vm.runTransfer(TransferKind.PUSH) },
+                            onCancel = { activeTransfer?.let { transferManager.cancel(it.id) } },
                         )
                     }
                     item(key = "info") {
@@ -328,5 +357,64 @@ private fun SyncEventRow(event: SyncLogEntity) {
             fontWeight = FontWeight.Medium,
             color = scheme.onSurfaceVariant,
         )
+    }
+}
+
+
+/**
+ * Fetch / Pull / Push where you can see the state they act on. Whichever has something pending is
+ * emphasised (Pull when you're behind, Push when you're ahead) so the next step is the obvious one;
+ * while a transfer for this repo runs, the buttons give way to its live progress.
+ */
+@Composable
+private fun SyncCard(
+    state: OverviewUiState,
+    active: TransferTask?,
+    onFetch: () -> Unit,
+    onPull: () -> Unit,
+    onPush: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AppCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp)) {
+            if (active != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${active.kind.doing}… ${active.statusLine()}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (!active.indeterminate && active.state == TransferState.RUNNING) {
+                        Text("${(active.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge)
+                    }
+                    TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Text("Cancel") }
+                }
+                TransferProgressBar(active, Modifier.fillMaxWidth())
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(onClick = onFetch, modifier = Modifier.weight(1f)) { Text("Fetch") }
+                    if (state.behind > 0) {
+                        Button(onClick = onPull, modifier = Modifier.weight(1f)) { Text("Pull ↓${state.behind}") }
+                    } else {
+                        OutlinedButton(onClick = onPull, modifier = Modifier.weight(1f)) { Text("Pull") }
+                    }
+                    if (state.ahead > 0) {
+                        Button(
+                            onClick = onPush,
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.secondary,
+                                contentColor = MaterialTheme.colorScheme.onSecondary,
+                            ),
+                        ) { Text("Push ↑${state.ahead}") }
+                    } else {
+                        OutlinedButton(onClick = onPush, modifier = Modifier.weight(1f)) { Text("Push") }
+                    }
+                }
+            }
+        }
     }
 }

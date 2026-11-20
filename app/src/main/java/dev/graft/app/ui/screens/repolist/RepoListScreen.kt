@@ -40,6 +40,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.graft.app.data.RepoStorage
 import dev.graft.app.git.GitErrors
+import dev.graft.app.ui.components.openUrl
+import dev.graft.app.git.browserUrlFor
 import dev.graft.app.transfer.statusLine
 import dev.graft.app.ui.components.TransferProgressBar
 import dev.graft.app.transfer.TransferTask
@@ -146,6 +148,25 @@ fun RepoListScreen(
                                     onClick = { showSortMenu = false; vm.setSortMode(RepoSortMode.HAS_CHANGES) })
                             }
                         }
+                        // Fetch / pull every repo at once. Background transfers, one summary at the end.
+                        if (state.repos.any { it.cloneUrl.isNotBlank() }) {
+                            var showSyncAll by remember { mutableStateOf(false) }
+                            Box {
+                                IconButton(onClick = { showSyncAll = true }) { Icon(Icons.Filled.Sync, "Sync all") }
+                                DropdownMenu(expanded = showSyncAll, onDismissRequest = { showSyncAll = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text("Fetch all") },
+                                        leadingIcon = { Icon(Icons.Filled.Download, null) },
+                                        onClick = { showSyncAll = false; vm.syncAll(TransferKind.FETCH) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Pull all (clean repos)") },
+                                        leadingIcon = { Icon(Icons.Filled.ArrowDownward, null) },
+                                        onClick = { showSyncAll = false; vm.syncAll(TransferKind.PULL) },
+                                    )
+                                }
+                            }
+                        }
                         // Transfers history, with a badge while something is running.
                         if (transfers.isNotEmpty()) {
                             IconButton(onClick = onOpenTransfers) {
@@ -237,6 +258,8 @@ fun RepoListScreen(
                                 onRequestPushForce = { repoPendingPushForce = repo },
                                 onSetCredential = { repoPendingCredential = repo },
                                 onDismissError = { vm.dismissError(repo) },
+                                pinned = repo.id in state.pinnedIds,
+                                onTogglePin = { vm.togglePin(repo) },
                                 // Springy placement: repos entering, leaving or reordering settle into
                                 // place with a little bounce instead of snapping.
                                 itemModifier = Modifier.animateItem(
@@ -509,9 +532,14 @@ private fun RepoCard(
     onFetch: () -> Unit, onRequestPullForce: () -> Unit, onRequestPushForce: () -> Unit,
     onSetCredential: () -> Unit,
     onDismissError: () -> Unit,
+    pinned: Boolean = false,
+    onTogglePin: () -> Unit = {},
     itemModifier: Modifier = Modifier,
 ) {
     var showMore by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val webUrl = remember(repo.cloneUrl) { browserUrlFor(repo.cloneUrl) }
     val hasError = repo.lastError.isNotBlank()
     val hasCredential = repo.credentialId != 0L
     // The exact wording JGit throws for a private/auth-needed remote with no credential
@@ -550,8 +578,13 @@ private fun RepoCard(
                 Spacer(Modifier.width(10.dp))
                 Text(
                     repo.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyLarge,
-                    maxLines = 1, modifier = Modifier.weight(1f),
+                    maxLines = 1, modifier = Modifier.weight(1f, fill = false),
                 )
+                if (pinned) {
+                    Spacer(Modifier.width(6.dp))
+                    Icon(Icons.Filled.Star, "Pinned", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.secondary)
+                }
+                Spacer(Modifier.weight(1f))
                 Spacer(Modifier.width(8.dp))
                 // One glance, one word — the whole point of a repo list is scanning which
                 // ones need attention without opening each one. A tiny badge riding on the
@@ -563,6 +596,30 @@ private fun RepoCard(
                         Icon(Icons.Filled.MoreVert, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     DropdownMenu(expanded = showMore, onDismissRequest = { showMore = false }) {
+                        DropdownMenuItem(
+                            text = { Text(if (pinned) "Unpin" else "Pin to top") },
+                            onClick = { showMore = false; onTogglePin() },
+                            leadingIcon = { Icon(Icons.Filled.Star, null, tint = if (pinned) MaterialTheme.colorScheme.secondary else LocalContentColor.current) },
+                        )
+                        if (webUrl != null) {
+                            DropdownMenuItem(
+                                text = { Text("Open in browser") },
+                                onClick = { showMore = false; openUrl(context, webUrl) },
+                                leadingIcon = { Icon(Icons.Filled.Language, null) },
+                            )
+                        }
+                        if (repo.cloneUrl.isNotBlank()) {
+                            DropdownMenuItem(
+                                text = { Text("Copy clone URL") },
+                                onClick = {
+                                    showMore = false
+                                    // Never copy a token that may be embedded in the URL.
+                                    clipboard.setText(androidx.compose.ui.text.AnnotatedString(webUrl?.let { it + ".git" } ?: repo.cloneUrl))
+                                },
+                                leadingIcon = { Icon(Icons.Filled.ContentCopy, null) },
+                            )
+                        }
+                        HorizontalDivider()
                         DropdownMenuItem(text = { Text("Fetch") }, onClick = { showMore = false; onFetch() },
                             leadingIcon = { Icon(Icons.Filled.Download, null) })
                         DropdownMenuItem(text = { Text("Pull (Force)") }, onClick = { showMore = false; onRequestPullForce() },

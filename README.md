@@ -106,6 +106,16 @@ The editor (responsive: phone / large phone / tablet layouts so the filename alw
 - **Unsaved-changes guard** (Save / Discard / Keep editing), robust save, hardware shortcuts
   (Ctrl+S, F, G, D, Z/Y, /)
 
+## More features
+
+- **Pin to top** (card menu): pinned repos sort first in every sort mode; stored in prefs, no DB change.
+- **Fetch all / Pull all** (Home toolbar): parallel background transfers with one summary at the end.
+  *Pull all* skips repos with uncommitted changes and says how many it skipped.
+- **Open in browser / Copy clone URL** (card menu): tokens embedded in a URL are stripped, never copied.
+- **Pull requests tab** in Actions: open / merged / closed / all with counts; tap to open on GitHub.
+- **Overview sync card**: Fetch / Pull / Push right where the ahead/behind numbers are - Pull is
+  emphasised when you're behind, Push when you're ahead - with live progress while running.
+
 ## Errors
 
 Raw JGit exceptions are translated into plain language (`GitErrors`), classifying by the whole cause chain

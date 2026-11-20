@@ -110,6 +110,14 @@ edits to `RepoListScreen`, `SettingsScreen`, `CloneScreen`/`CloneViewModel`).
   uninitialised `this`; `conflate()` on a `StateFlow`; a duplicate `onCleared`; a top-level `val` reading
   `MaterialTheme`. The verifier now also checks icon imports.
 
+### Round 4: more features
+
+Pinned repos, Fetch/Pull all, open-in-browser + copy URL, pull requests tab (read-only: GitHub is where
+review/merge happen), and an actionable Overview. Deliberately **not** done, because they need either an
+unverified dependency or deeper JGit work I can't validate without a compiler: hunk-level staging (needs
+index surgery via `DirCacheEditor` plus per-hunk UI), SSH keys, biometric lock (`androidx.biometric`),
+interactive rebase.
+
 ### Known limits
 
 - Nothing here has been run or benchmarked; speed claims are from removing redundant work, not stopwatch

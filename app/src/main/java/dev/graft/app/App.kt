@@ -3,6 +3,7 @@ package dev.graft.app
 import android.app.Application
 import dev.graft.app.data.AppearancePrefs
 import dev.graft.app.data.GitIdentityPrefs
+import dev.graft.app.data.PinnedRepos
 import dev.graft.app.data.db.AppDatabase
 import dev.graft.app.data.repository.CredentialRepository
 import dev.graft.app.data.repository.RepoRepository
@@ -48,6 +49,7 @@ class App : Application() {
         JGitTuning.install(cacheDir)
         SyncNotifier.createChannel(this)
         AppearancePrefs.init(this)
+        PinnedRepos.init(this)
         GitIdentityPrefs.init(this)
 
         // WorkManager schedules survive normal process death but not a data wipe, so re-apply

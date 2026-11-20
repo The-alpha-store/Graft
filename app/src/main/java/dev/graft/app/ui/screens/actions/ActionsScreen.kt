@@ -52,6 +52,7 @@ import dev.graft.app.App
 import dev.graft.app.data.ApkInstaller
 import dev.graft.app.data.github.GitHubApi
 import dev.graft.app.data.github.GitHubResult
+import dev.graft.app.data.github.PullRequest
 import dev.graft.app.data.github.WorkflowArtifact
 import dev.graft.app.data.github.WorkflowJob
 import dev.graft.app.data.github.WorkflowRun
@@ -90,6 +91,9 @@ data class ActionsUiState(
     val artifactsByRun: Map<Long, List<WorkflowArtifact>> = emptyMap(),
     val loadingArtifactsForRun: Long? = null,
     val installingArtifactId: Long? = null,
+    val pullRequests: List<PullRequest> = emptyList(),
+    val prLoading: Boolean = false,
+    val prLoaded: Boolean = false,
 )
 
 class ActionsViewModel(app: Application) : AndroidViewModel(app) {
@@ -129,6 +133,22 @@ class ActionsViewModel(app: Application) : AndroidViewModel(app) {
                     _state.value = _state.value.copy(isRefreshing = false, message = if (silent) null else "GitHub: ${r.message}")
                 is GitHubResult.Success ->
                     _state.value = _state.value.copy(runs = r.data, isRefreshing = false)
+            }
+        }
+    }
+
+    /** Loads pull requests once (or again when [force]d, e.g. pull-to-refresh). */
+    fun loadPullRequests(force: Boolean = false) {
+        val fn = fullName ?: return
+        val tk = token ?: return
+        if (!force && _state.value.prLoaded) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(prLoading = true)
+            when (val r = GitHubApi.listPullRequests(fn, tk)) {
+                is GitHubResult.Error ->
+                    _state.value = _state.value.copy(prLoading = false, message = "GitHub: ${r.message}")
+                is GitHubResult.Success ->
+                    _state.value = _state.value.copy(pullRequests = r.data, prLoading = false, prLoaded = true)
             }
         }
     }
@@ -256,6 +276,7 @@ class ActionsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun dismissMessage() { _state.value = _state.value.copy(message = null) }
+    fun showMessage(text: String) { _state.value = _state.value.copy(message = text) }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -305,7 +326,8 @@ fun ActionsScreen(repoId: Long, onBack: () -> Unit, vm: ActionsViewModel = viewM
         Column(Modifier.fillMaxSize().padding(pad)) {
             TabRow(selectedTabIndex = tab, containerColor = androidx.compose.ui.graphics.Color.Transparent) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Runs") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Templates") })
+                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("PRs") })
+                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Templates") })
             }
             if (tab == 0) {
                 RefreshBox(
@@ -376,6 +398,14 @@ fun ActionsScreen(repoId: Long, onBack: () -> Unit, vm: ActionsViewModel = viewM
             }
         }
                 }
+            } else if (tab == 1) {
+                val context = androidx.compose.ui.platform.LocalContext.current
+                PullRequestsTab(
+                    state = state,
+                    onLoad = { vm.loadPullRequests() },
+                    onRefresh = { vm.loadPullRequests(force = true) },
+                    onOpen = { url -> if (!dev.graft.app.ui.components.openUrl(context, url)) vm.showMessage("No browser available") },
+                )
             } else {
                 WorkflowTemplatesTab(repoId = repoId, snack = snack)
             }

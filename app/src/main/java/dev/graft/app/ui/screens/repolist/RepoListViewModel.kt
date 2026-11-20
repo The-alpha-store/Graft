@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.graft.app.App
+import dev.graft.app.data.PinnedRepos
 import dev.graft.app.data.RepoStatusStore
 import org.eclipse.jgit.lib.ProgressMonitor
 import dev.graft.app.transfer.awaitResult
@@ -37,6 +38,8 @@ data class RepoListUiState(
     /** Uncommitted (staged + unstaged) file count per repo id, for the list badge. Absent
      * key = not computed yet (e.g. still opening the repo), not necessarily zero changes. */
     val changeCounts: Map<Long, Int> = emptyMap(),
+    /** Repos the user pinned: they sort to the top in every sort mode. */
+    val pinnedIds: Set<Long> = emptySet(),
 ) {
     /** Repos filtered by [searchQuery] (name or clone URL, case-insensitive) and sorted by
      * [sortMode]. Computed here rather than stored separately so there's exactly one source
@@ -50,11 +53,13 @@ data class RepoListUiState(
                     it.cloneUrl.contains(searchQuery, ignoreCase = true)
             }
         }
-        return when (sortMode) {
+        val sorted = when (sortMode) {
             RepoSortMode.RECENT -> filtered.sortedByDescending { it.addedAt }
             RepoSortMode.NAME -> filtered.sortedBy { it.name.lowercase() }
             RepoSortMode.HAS_CHANGES -> filtered.sortedByDescending { changeCounts[it.id] ?: -1 }
         }
+        // Stable: pinned repos keep the chosen sort order among themselves, and so do the rest.
+        return sorted.sortedByDescending { it.id in pinnedIds }
     }
 }
 
@@ -78,8 +83,8 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     val uiState: StateFlow<RepoListUiState> = combine(
-        baseState, credentialRepository.allCredentials,
-    ) { state, credentials -> state.copy(credentials = credentials) }
+        baseState, credentialRepository.allCredentials, PinnedRepos.ids,
+    ) { state, credentials, pinned -> state.copy(credentials = credentials, pinnedIds = pinned) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), RepoListUiState())
 
     init {
@@ -143,6 +148,62 @@ class RepoListViewModel(app: Application) : AndroidViewModel(app) {
             }
         } finally {
             inFlight.remove(repo.id)
+        }
+    }
+
+    fun togglePin(repo: RepoEntity) { PinnedRepos.toggle(appRef, repo.id) }
+
+    /**
+     * Fetch (or fast-pull) every repo that has a remote, as parallel background transfers - the
+     * manager caps how many actually run at once. Pull skips repos with uncommitted changes: merging
+     * into a dirty working tree across a dozen repos unattended is how people lose work.
+     * Reports one summary instead of a snackbar per repo.
+     */
+    fun syncAll(kind: TransferKind) {
+        val state = uiState.value
+        val withRemote = state.repos.filter { it.cloneUrl.isNotBlank() }
+        val targets = if (kind == TransferKind.PULL) {
+            withRemote.filter { (state.changeCounts[it.id] ?: 0) == 0 }
+        } else withRemote
+        if (targets.isEmpty()) {
+            snackbarMessage.value = if (withRemote.isEmpty()) "None of your repositories has a remote."
+            else "Every repository has uncommitted changes - commit or stash first."
+            return
+        }
+        val skipped = withRemote.size - targets.size
+        viewModelScope.launch {
+            snackbarMessage.value = "${kind.doing} ${targets.size} repositor${if (targets.size == 1) "y" else "ies"}…"
+            val manager = appRef.transferManager
+            val results = coroutineScope {
+                targets.map { repo ->
+                    async {
+                        val cred = if (repo.credentialId != 0L) credentialRepository.getById(repo.credentialId) else null
+                        val outcome = manager.enqueue(
+                            kind = kind, repoId = repo.id, title = repo.name, watchDir = File(repo.fullSavePath),
+                        ) { reporter ->
+                            manager.withGit(repo.fullSavePath) { git ->
+                                if (kind == TransferKind.PULL) GitEngine.pullMerge(git, cred, reporter.monitor)
+                                else GitEngine.fetch(git, credential = cred, monitor = reporter.monitor, skipTags = true)
+                            }
+                        }.awaitResult()
+                        when (outcome) {
+                            is GitResult.Success -> {
+                                repoRepository.markSyncSuccess(repo.id)
+                                computeChangeCount(repo)
+                            }
+                            is GitResult.Error -> if (outcome.message != "Cancelled") repoRepository.markError(repo.id, outcome.message)
+                        }
+                        outcome
+                    }
+                }.awaitAll()
+            }
+            val ok = results.count { it is GitResult.Success<*> }
+            val failed = results.size - ok
+            snackbarMessage.value = buildString {
+                append("${if (kind == TransferKind.PULL) "Pulled" else "Fetched"} $ok of ${results.size}")
+                if (failed > 0) append(" · $failed failed (see Transfers)")
+                if (skipped > 0) append(" · $skipped skipped (uncommitted changes)")
+            }
         }
     }
 
