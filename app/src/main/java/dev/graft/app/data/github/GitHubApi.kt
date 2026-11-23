@@ -294,6 +294,21 @@ object GitHubApi {
             is GitHubResult.Success -> GitHubResult.Success(Unit)
         }
 
+    /**
+     * Triggers a `workflow_dispatch` workflow on [ref] with [inputs]. GitHub answers 204 with no body, so
+     * success carries nothing; the new run shows up in the runs list a few seconds later.
+     */
+    suspend fun dispatchWorkflow(
+        fullName: String, token: String, workflowFile: String, ref: String, inputs: Map<String, String>,
+    ): GitHubResult<Unit> {
+        val body = JSONObject().put("ref", ref).put("inputs", JSONObject(inputs)).toString()
+        val url = "$BASE/repos/$fullName/actions/workflows/$workflowFile/dispatches"
+        return when (val r = http(url, "POST", token, body)) {
+            is GitHubResult.Error -> r
+            is GitHubResult.Success -> GitHubResult.Success(Unit)
+        }
+    }
+
     suspend fun cancelWorkflowRun(fullName: String, runId: Long, token: String): GitHubResult<Unit> =
         when (val r = http("$BASE/repos/$fullName/actions/runs/$runId/cancel", "POST", token)) {
             is GitHubResult.Error -> r

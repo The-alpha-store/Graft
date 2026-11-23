@@ -16,6 +16,90 @@ data class WorkflowTemplate(
 object WorkflowTemplateCatalog {
   val templates = listOf(
     WorkflowTemplate(
+      id = "graft_remote_run",
+      name = "Graft remote runner",
+      fileName = ".github/workflows/graft-run.yml",
+      description = "Lets the Graft console run any command - cargo, npm, gradle, python... - on a GitHub runner and bring the results back. Install it once, then just type commands.",
+      category = "Utilities",
+      yamlContent = """name: Graft remote run
+
+# Runs ONE command on a clean GitHub-hosted Ubuntu runner, on request from the Graft console.
+# ubuntu-latest already has Rust (cargo, rustfmt, clippy), Node, Python, Go, Java and Gradle.
+# If "commit" is true, any files the command changed are committed and pushed back to the same branch.
+# The command travels through an environment variable, never pasted into the script, so it can't
+# break out of its quotes.
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Command to run in the repository root"
+        required: true
+        type: string
+      commit:
+        description: "Commit and push any files the command changed"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    name: run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run command
+        env:
+          GRAFT_COMMAND: ${'$'}{{ inputs.command }}
+        run: bash -c "${'$'}GRAFT_COMMAND"
+
+      - name: Commit changes
+        if: ${'$'}{{ inputs.commit == 'true' }}
+        env:
+          GRAFT_COMMAND: ${'$'}{{ inputs.command }}
+        run: |
+          if [ -n "${'$'}(git status --porcelain)" ]; then
+            git config user.name "graft[bot]"
+            git config user.email "graft-bot@users.noreply.github.com"
+            git add -A
+            git commit -m "chore: run '${'$'}GRAFT_COMMAND' (from Graft)"
+            git push
+          else
+            echo "No files were changed."
+          fi
+"""
+    ),
+    WorkflowTemplate(
+      id = "rust_ci",
+      name = "Rust CI (fmt, clippy, test)",
+      fileName = ".github/workflows/rust-ci.yml",
+      description = "Checks formatting, lints with clippy (warnings are errors) and runs the tests on every push and pull request.",
+      category = "Lint & Test",
+      yamlContent = """name: Rust CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --all
+"""
+    ),
+    WorkflowTemplate(
       id = "android_ci_build",
       name = "Android CI (Build & Unit Tests)",
       fileName = ".github/workflows/android-ci.yml",

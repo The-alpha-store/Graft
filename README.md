@@ -106,6 +106,28 @@ The editor (responsive: phone / large phone / tablet layouts so the filename alw
 - **Unsaved-changes guard** (Save / Discard / Keep editing), robust save, hardware shortcuts
   (Ctrl+S, F, G, D, Z/Y, /)
 
+## Console: one prompt, any command
+
+You never pick a mode. Whatever you type is routed automatically (`ConsoleRouter`):
+
+1. **Git** (with or without `git`): `status diff log show blame branch add restore rm mv commit push pull fetch
+   switch checkout merge rebase cherry-pick stash reset tag remote clean reflog ls-files config describe
+   rev-parse shortlog gc`, plus aliases `st co br ci lg last unstage`. Runs on the in-app JGit engine.
+2. **Anything else** is tried on the device's own shell (`sh -c`) in the repo folder: `ls cat grep find sed head
+   tail wc sort cp mv mkdir touch diff...` - whatever Android ships. `!cmd` forces the shell where a git command
+   shares the name (`rm`, `mv`). Stop (✕) kills it.
+3. **If the device doesn't have the program** (`cargo`, `npm`, `gradle`, `python`... - a stock phone has no
+   toolchains, and an app can't borrow Termux's or execute downloaded binaries), the console offers - once - to
+   run it on a **GitHub Actions runner** and brings back the output. With *Always*, it stops asking.
+
+Cloud details: install the runner once with `cloud setup` (writes `.github/workflows/graft-run.yml`; add, commit,
+push it). Then e.g. `cargo fmt --all` runs on a clean Ubuntu runner (Rust, Node, Python, Go, Java, Gradle are
+preinstalled), the log is streamed back with the CI noise stripped, files the command changed are committed and
+pushed, and the console pulls them (if your tree is clean). `cloud --no-commit <cmd>` is check-only. Caveats shown
+before every run: the runner sees what's **pushed** (not unpushed commits or uncommitted edits), it uses your
+Actions minutes, and your token needs the `workflow` scope. Stop also cancels the run on GitHub. The command
+reaches the runner through an environment variable, never pasted into a script, so quotes can't break out.
+
 ## More features
 
 - **Pin to top** (card menu): pinned repos sort first in every sort mode; stored in prefs, no DB change.

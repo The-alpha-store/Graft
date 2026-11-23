@@ -22,7 +22,20 @@ import org.eclipse.jgit.api.Git
  */
 object GitConsoleInterpreter {
 
-    val UNSUPPORTED_COMMANDS = setOf("reflog", "ls-files", "config", "clone", "init", "cherry-pick", "bisect", "submodule")
+    /** Genuinely unavailable here. (`reflog`, `ls-files`, `config`, `cherry-pick`, `blame` used to be listed;
+     *  they now live in [GitConsoleExtras].) */
+    val UNSUPPORTED_COMMANDS = setOf("clone", "init", "bisect", "submodule")
+
+    /** Short forms people type from muscle memory. Only the *first* word is expanded. */
+    private val ALIASES = mapOf(
+        "st" to listOf("status"),
+        "co" to listOf("checkout"),
+        "br" to listOf("branch"),
+        "ci" to listOf("commit"),
+        "lg" to listOf("log", "--oneline", "-20"),
+        "last" to listOf("log", "-1"),
+        "unstage" to listOf("reset", "HEAD", "--"),
+    )
 
     /** Non-null means this command needs a confirmation prompt before [run] is called, with
      *  this as the warning text shown. */
@@ -68,17 +81,16 @@ object GitConsoleInterpreter {
         val tokens = tokenize(trimmed).toMutableList()
         if (tokens.firstOrNull() == "git") tokens.removeAt(0)
         if (tokens.isEmpty()) return "usage: git <command> [<args>]"
-        val cmd = tokens.removeAt(0)
-        val args = tokens
+        var cmd = tokens.removeAt(0)
+        var args: List<String> = tokens
+        ALIASES[cmd]?.let { expansion -> cmd = expansion.first(); args = expansion.drop(1) + args }
 
         if (cmd in UNSUPPORTED_COMMANDS) {
             return when (cmd) {
                 "clone", "init" -> "'$cmd' isn't run from inside an already-open repo — use \"Clone by URL\" or Discover on the repo list instead."
-                "config" -> "Git identity is set in Settings \u2192 Git identity, not from this console."
                 else -> "'$cmd' isn't supported in this console yet."
             }
         }
-        if (cmd == "blame") return "Use \"Blame\" on a file in the File Explorer for this \u2014 it renders per-line author/commit info, which doesn't translate well to plain text here."
 
         return try {
             when (cmd) {
@@ -103,10 +115,11 @@ object GitConsoleInterpreter {
                 "tag" -> cmdTag(git, args, credential)
                 "remote" -> cmdRemote(git, args)
                 "clean" -> cmdClean(git, args)
-                else -> "git: '$cmd' is not recognized by this console \u2014 see the Help tab for what's supported."
+                else -> GitConsoleExtras.run(git, cmd, args)
+                    ?: "git: '$cmd' is not a git command this console knows - try `help`, or run it as a shell command with !$cmd."
             }
         } catch (e: Exception) {
-            "error: ${e.message ?: e.javaClass.simpleName}"
+            "error: ${GitErrors.friendly(e)}"
         }
     }
 

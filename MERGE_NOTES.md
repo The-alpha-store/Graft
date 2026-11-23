@@ -118,6 +118,17 @@ unverified dependency or deeper JGit work I can't validate without a compiler: h
 index surgery via `DirCacheEditor` plus per-hunk UI), SSH keys, biometric lock (`androidx.biometric`),
 interactive rebase.
 
+### Round 5: general-purpose console
+
+New: `ConsoleRouter` (automatic routing), `GitConsoleExtras` (show/reflog/blame/shortlog/describe/ls-files/
+config/cherry-pick/rev-parse/gc + aliases), `ShellRunner` (cancellable `sh -c`), `CloudRunner` +
+`graft-run.yml` template (dispatch -> poll -> log -> pull), a Rust CI template. The sandbox was reset between
+turns; the project was restored from the previously delivered zip and the verifier rebuilt.
+
+Limits: `cargo`/`npm`/etc. cannot run on the phone itself - the cloud path is the honest substitute and needs a
+GitHub remote, a token with `workflow` scope, and the runner workflow pushed to the repo. A `;`/`&&` chain whose
+*later* part is missing runs the earlier part locally first, then the whole line in the cloud.
+
 ### Known limits
 
 - Nothing here has been run or benchmarked; speed claims are from removing redundant work, not stopwatch

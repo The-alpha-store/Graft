@@ -18,6 +18,8 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import dev.graft.app.ui.components.ScreenTopBar
 import androidx.compose.material.icons.filled.HelpOutline
@@ -37,6 +39,18 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.graft.app.App
 import dev.graft.app.data.GitIdentityPrefs
+import dev.graft.app.data.ConsolePrefs
+import dev.graft.app.data.github.WorkflowTemplateCatalog
+import dev.graft.app.data.github.githubFullNameFromUrl
+import dev.graft.app.git.CloudRunner
+import dev.graft.app.git.ConsoleRouter
+import dev.graft.app.git.ShellResult
+import dev.graft.app.git.ShellRunner
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
+import java.io.File
 import dev.graft.app.git.GitConsoleInterpreter
 import dev.graft.app.git.GitEngine
 import dev.graft.app.git.GitResult
@@ -45,21 +59,36 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-data class ConsoleLine(val command: String, val output: String, val isError: Boolean)
+data class ConsoleLine(
+    val command: String,
+    val output: String,
+    val isError: Boolean,
+    /** True while a long-running command (shell / cloud) is still producing its status text. */
+    val isLive: Boolean = false,
+)
+
+/** A command waiting for the person's yes/no before it goes to the cloud. */
+data class PendingCloud(val rawInput: String, val command: String, val commit: Boolean, val reason: String?, val warning: String)
 
 data class ConsoleUiState(
     val repoName: String = "",
     val history: List<ConsoleLine> = emptyList(),
     val commandHistory: List<String> = emptyList(),
     val isRunning: Boolean = false,
+    /** Shell and cloud runs can be stopped; a git command can't be interrupted mid-JGit-call. */
+    val canStop: Boolean = false,
     val pendingDangerCommand: String? = null,
     val pendingDangerWarning: String? = null,
+    val pendingCloud: PendingCloud? = null,
 )
 
 /**
- * Runs typed git commands against this repo via [GitConsoleInterpreter] — see that file for
- * exactly what's supported and why a handful of commands aren't (there's no bundled `git`
- * binary here, this dispatches onto the same [GitEngine] every other screen already uses).
+ * One prompt for everything. [ConsoleRouter] decides where a line goes:
+ *
+ * - **git** commands run on the in-app git engine ([GitConsoleInterpreter] / [GitConsoleExtras]);
+ * - anything else is tried on the **device shell** ([ShellRunner]) in the repo folder;
+ * - if the device doesn't have the program (`cargo`, `npm`, `gradle`...), it offers once to run the command
+ *   on a **GitHub Actions runner** ([CloudRunner]) and brings the output - and any files it changed - back.
  */
 class GitConsoleViewModel(app: Application) : AndroidViewModel(app) {
     private val appRef = app as App
@@ -70,6 +99,7 @@ class GitConsoleViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<ConsoleUiState> = _state.asStateFlow()
 
     private var repoId: Long = -1
+    private var runJob: Job? = null
 
     fun load(id: Long) {
         repoId = id
@@ -79,31 +109,50 @@ class GitConsoleViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** First pass: checked before actually running anything, so the screen can show a
-     *  confirmation prompt for the small set of genuinely destructive commands. */
+    /** First pass: classify, and confirm anything destructive before it runs. */
     fun submit(rawCommand: String) {
-        if (rawCommand.isBlank()) return
-        val warning = GitConsoleInterpreter.dangerWarning(rawCommand)
+        if (rawCommand.isBlank() || _state.value.isRunning) return
+        val route = ConsoleRouter.classify(rawCommand)
+        val warning = when (route) {
+            is ConsoleRouter.Route.Git -> GitConsoleInterpreter.dangerWarning(rawCommand)
+            is ConsoleRouter.Route.Shell -> ConsoleRouter.shellDanger(route.raw)
+            else -> null
+        }
         if (warning != null) {
             _state.value = _state.value.copy(pendingDangerCommand = rawCommand, pendingDangerWarning = warning)
         } else {
-            execute(rawCommand)
+            dispatch(rawCommand, route)
         }
     }
 
     fun confirmPendingDanger() {
         val cmd = _state.value.pendingDangerCommand ?: return
         _state.value = _state.value.copy(pendingDangerCommand = null, pendingDangerWarning = null)
-        execute(cmd)
+        dispatch(cmd, ConsoleRouter.classify(cmd))
     }
 
     fun dismissPendingDanger() {
         _state.value = _state.value.copy(pendingDangerCommand = null, pendingDangerWarning = null)
     }
 
-    private fun execute(rawCommand: String) {
-        viewModelScope.launch {
-            _state.value = _state.value.copy(isRunning = true, commandHistory = _state.value.commandHistory + rawCommand)
+    private fun dispatch(raw: String, route: ConsoleRouter.Route) {
+        _state.value = _state.value.copy(commandHistory = _state.value.commandHistory + raw)
+        when (route) {
+            ConsoleRouter.Route.Clear -> clear()
+            is ConsoleRouter.Route.Git -> runGit(raw)
+            is ConsoleRouter.Route.Shell -> runShell(raw, route.raw)
+            is ConsoleRouter.Route.Cloud -> prepareCloud(raw, route.command, route.commit, reason = null)
+            ConsoleRouter.Route.CloudSetup -> runCloudSetup(raw)
+        }
+    }
+
+    fun stop() { runJob?.cancel() }
+
+    // ------------------------------------------------------------------------------------- git
+
+    private fun runGit(rawCommand: String) {
+        runJob = viewModelScope.launch {
+            _state.value = _state.value.copy(isRunning = true)
             val repo = repoRepo.getById(repoId)
             if (repo == null) {
                 appendLine(rawCommand, "error: repo not found", true)
@@ -126,8 +175,207 @@ class GitConsoleViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ------------------------------------------------------------------------------------ shell
+
+    private fun runShell(rawInput: String, command: String) {
+        runJob = viewModelScope.launch {
+            _state.value = _state.value.copy(isRunning = true, canStop = true)
+            try {
+                val repo = repoRepo.getById(repoId)
+                if (repo == null) {
+                    appendLine(rawInput, "error: repo not found", true)
+                    return@launch
+                }
+                val result = ShellRunner.run(command, File(repo.fullSavePath))
+                when {
+                    result.commandNotFound -> {
+                        val reason = "`${ConsoleRouter.programOf(command)}` isn't available on this device."
+                        if (ConsolePrefs.autoCloud(appRef)) {
+                            _state.value = _state.value.copy(isRunning = false, canStop = false)
+                            prepareCloud(rawInput, command, commit = true, reason = reason, skipConfirm = true)
+                        } else {
+                            _state.value = _state.value.copy(isRunning = false, canStop = false)
+                            prepareCloud(rawInput, command, commit = true, reason = reason)
+                        }
+                    }
+                    else -> appendLine(rawInput, formatShell(result), isError = !result.succeeded)
+                }
+            } catch (e: CancellationException) {
+                appendLine(rawInput, "^C", true)
+                throw e
+            } finally {
+                _state.value = _state.value.copy(isRunning = false, canStop = false)
+            }
+        }
+    }
+
+    private fun formatShell(r: ShellResult): String {
+        val body = r.output.ifBlank { if (r.succeeded) "(no output)" else "" }
+        val tail = when {
+            r.timedOut -> "\n[timed out after 120 s]"
+            r.exitCode != 0 -> "\n[exit ${r.exitCode}]"
+            else -> ""
+        }
+        return (body + tail).trimStart('\n')
+    }
+
+    // ------------------------------------------------------------------------------------ cloud
+
+    /**
+     * Checks everything the cloud run needs (a GitHub remote, a token, the runner workflow in the repo),
+     * works out what the runner *won't* see (unpushed / uncommitted work), then asks - once.
+     */
+    private fun prepareCloud(raw: String, command: String, commit: Boolean, reason: String?, skipConfirm: Boolean = false) {
+        if (command.isBlank()) {
+            appendLine(raw, "usage: cloud <command>   e.g. cloud cargo fmt --all", true)
+            return
+        }
+        viewModelScope.launch {
+            val repo = repoRepo.getById(repoId)
+            if (repo == null) { appendLine(raw, "error: repo not found", true); return@launch }
+            val fullName = githubFullNameFromUrl(repo.cloneUrl)
+            if (fullName == null) {
+                appendLine(raw, (reason?.plus(" ") ?: "") + "Running it in the cloud needs a GitHub remote, and this repo's isn't one.", true)
+                return@launch
+            }
+            val credential = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
+            if (credential == null) {
+                appendLine(raw, (reason?.plus(" ") ?: "") + "To run it in the cloud, attach a credential with a GitHub token to this repo (Settings → Credentials).", true)
+                return@launch
+            }
+            if (!File(repo.fullSavePath, CloudRunner.WORKFLOW_PATH).exists()) {
+                appendLine(raw, (reason?.plus(" ") ?: "") + "To run it in the cloud, install the runner once: type `cloud setup`, then add, commit and push the new file.", true)
+                return@launch
+            }
+
+            // What will the runner NOT see? It checks out what's pushed.
+            var ahead = 0
+            var dirty = false
+            when (val opened = GitEngine.openRepo(repo.fullSavePath)) {
+                is GitResult.Success -> {
+                    val git = opened.data
+                    ahead = GitEngine.getAheadBehind(git).getOrNull()?.first ?: 0
+                    dirty = GitEngine.getStatus(git).getOrNull().orEmpty().isNotEmpty()
+                    git.close()
+                }
+                is GitResult.Error -> Unit
+            }
+            val warning = buildString {
+                append("Runs on a GitHub-hosted Ubuntu runner (it uses your Actions minutes).")
+                if (commit) append("\n• Files the command changes are committed and pushed to this branch, then pulled here.")
+                else append("\n• Check-only: nothing is committed.")
+                if (ahead > 0) append("\n• $ahead unpushed commit${if (ahead == 1) "" else "s"} won't be included - push first.")
+                if (dirty) append("\n• Uncommitted changes here won't be included.")
+            }
+            val pending = PendingCloud(raw, command, commit, reason, warning)
+            if (skipConfirm) runCloud(pending) else _state.value = _state.value.copy(pendingCloud = pending)
+        }
+    }
+
+    fun confirmCloud(always: Boolean) {
+        val pending = _state.value.pendingCloud ?: return
+        _state.value = _state.value.copy(pendingCloud = null)
+        if (always) ConsolePrefs.setAutoCloud(appRef, true)
+        runCloud(pending)
+    }
+
+    fun dismissCloud() {
+        val pending = _state.value.pendingCloud ?: return
+        _state.value = _state.value.copy(pendingCloud = null)
+        appendLine(pending.rawInput, (pending.reason?.plus(" ") ?: "") + "Not run.", true)
+    }
+
+    private fun runCloud(pending: PendingCloud) {
+        runJob = viewModelScope.launch {
+            _state.value = _state.value.copy(isRunning = true, canStop = true)
+            val index = beginLive(pending.rawInput, "⏳ Starting…")
+            try {
+                val repo = repoRepo.getById(repoId) ?: run { setLine(index, "error: repo not found", true, false); return@launch }
+                val fullName = githubFullNameFromUrl(repo.cloneUrl) ?: run { setLine(index, "error: not a GitHub repo", true, false); return@launch }
+                val credential = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
+                val token = credential?.token ?: run { setLine(index, "error: no token on this repo's credential", true, false); return@launch }
+                val branch = when (val opened = GitEngine.openRepo(repo.fullSavePath)) {
+                    is GitResult.Success -> GitEngine.getCurrentBranch(opened.data).getOrNull().also { opened.data.close() }
+                    is GitResult.Error -> null
+                }.orEmpty().ifBlank { repo.branch }
+
+                val result = CloudRunner.run(fullName, token, branch, pending.command, pending.commit) { status ->
+                    setLine(index, "⏳ $status", false, true)
+                }
+                var text = result.text
+                if (result.ok && pending.commit) text += "\n\n" + pullAfterCloud(repo)
+                if (result.url != null) text += "\n\n" + result.url
+                setLine(index, text, isError = !result.ok, live = false)
+            } catch (e: CancellationException) {
+                setLine(index, "^C  Stopped. The run on GitHub was cancelled.", true, false)
+                throw e
+            } finally {
+                _state.value = _state.value.copy(isRunning = false, canStop = false)
+            }
+        }
+    }
+
+    /** After a cloud run that may have pushed changes: bring them here if it's safe to. */
+    private suspend fun pullAfterCloud(repo: dev.graft.app.data.db.entity.RepoEntity): String {
+        val opened = GitEngine.openRepo(repo.fullSavePath)
+        if (opened !is GitResult.Success) return "↳ couldn't open the repo to pull the result."
+        val git = opened.data
+        try {
+            val dirty = GitEngine.getStatus(git).getOrNull().orEmpty().isNotEmpty()
+            if (dirty) return "↳ Changes (if any) were pushed to GitHub. You have local edits, so commit or stash them, then run `pull`."
+            val credential = if (repo.credentialId != 0L) credRepo.getById(repo.credentialId) else null
+            val out = GitConsoleInterpreter.run(
+                git, credential, GitIdentityPrefs.currentName(appRef), GitIdentityPrefs.currentEmail(appRef), "pull",
+            )
+            return "↳ pull: $out"
+        } finally {
+            git.close()
+        }
+    }
+
+    private fun runCloudSetup(raw: String) {
+        viewModelScope.launch {
+            val repo = repoRepo.getById(repoId)
+            val template = WorkflowTemplateCatalog.byFileName(CloudRunner.WORKFLOW_PATH)
+            if (repo == null || template == null) { appendLine(raw, "error: couldn't set up the runner", true); return@launch }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val file = File(repo.fullSavePath, CloudRunner.WORKFLOW_PATH)
+                    file.parentFile?.mkdirs()
+                    file.writeText(template.yamlContent)
+                }
+            }
+            if (result.isSuccess) {
+                appendLine(
+                    raw,
+                    "Created ${CloudRunner.WORKFLOW_PATH}\n\nNow publish it (to the default branch):\n  add .github\n  commit -m \"Add Graft runner\"\n  push\n\n" +
+                        "After that, just type commands - anything this device can't run (cargo, npm, gradle, python...) offers to run in the cloud.",
+                    false,
+                )
+            } else {
+                appendLine(raw, "error: couldn't write the workflow: ${result.exceptionOrNull()?.message}", true)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------- transcript
+
     private fun appendLine(command: String, output: String, isError: Boolean) {
         _state.value = _state.value.copy(history = _state.value.history + ConsoleLine(command, output, isError))
+    }
+
+    private fun beginLive(command: String, text: String): Int {
+        val history = _state.value.history + ConsoleLine(command, text, false, isLive = true)
+        _state.value = _state.value.copy(history = history)
+        return history.lastIndex
+    }
+
+    private fun setLine(index: Int, output: String, isError: Boolean, live: Boolean) {
+        val history = _state.value.history.toMutableList()
+        if (index in history.indices) {
+            history[index] = history[index].copy(output = output, isError = isError, isLive = live)
+            _state.value = _state.value.copy(history = history)
+        }
     }
 
     fun clear() {
@@ -139,6 +387,7 @@ private val EXAMPLE_COMMANDS = listOf(
     "status", "diff", "diff --cached", "log --oneline -10", "branch -a",
     "add .", "commit -m \"message\"", "push", "pull", "fetch",
     "stash", "stash list", "stash pop", "tag", "remote -v",
+    "show", "reflog", "blame README.md", "shortlog -sn", "ls -la", "grep -rn TODO .", "cargo fmt --all",
 )
 
 private class QuickCommand(val label: String, val command: String, val runNow: Boolean)
@@ -149,10 +398,15 @@ private val QUICK_COMMANDS = listOf(
     QuickCommand("diff", "diff", runNow = true),
     QuickCommand("branch", "branch -a", runNow = true),
     QuickCommand("stash list", "stash list", runNow = true),
+    QuickCommand("show", "show", runNow = true),
+    QuickCommand("reflog", "reflog", runNow = true),
+    QuickCommand("ls", "ls -la", runNow = true),
     QuickCommand("add .", "add .", runNow = false),
     QuickCommand("commit", "commit -m \"\"", runNow = false),
     QuickCommand("pull", "pull", runNow = false),
     QuickCommand("push", "push", runNow = false),
+    QuickCommand("cargo fmt", "cargo fmt --all", runNow = false),
+    QuickCommand("cloud setup", "cloud setup", runNow = false),
 )
 
 /** The whole session as plain text, the way it would look in a terminal. */
@@ -198,7 +452,7 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
                         enabled = state.history.isNotEmpty(),
                     ) { Icon(Icons.Filled.ContentCopy, "Copy transcript") }
                     IconButton(onClick = { showHelp = true }) { Icon(Icons.Filled.HelpOutline, "What's supported") }
-                    IconButton(onClick = vm::clear, enabled = state.history.isNotEmpty()) { Icon(Icons.Filled.Delete, "Clear") }
+                    IconButton(onClick = vm::clear, enabled = state.history.isNotEmpty() && !state.isRunning) { Icon(Icons.Filled.Delete, "Clear") }
                 },
             )
         },
@@ -287,7 +541,7 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
                     value = input,
                     onValueChange = { input = it },
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("git status", fontFamily = FontFamily.Monospace) },
+                    placeholder = { Text("any command — git status, ls, cargo fmt --all", fontFamily = FontFamily.Monospace, maxLines = 1) },
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
@@ -298,8 +552,13 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
                     ),
                 )
                 Spacer(Modifier.width(6.dp))
-                IconButton(onClick = { submit() }, enabled = input.isNotBlank() && !state.isRunning) {
-                    Icon(Icons.Filled.Send, "Run", tint = MaterialTheme.colorScheme.primary)
+                if (state.canStop) {
+                    // Shell and cloud runs can be interrupted (a cloud stop also cancels the run on GitHub).
+                    IconButton(onClick = vm::stop) { Icon(Icons.Filled.Close, "Stop", tint = MaterialTheme.colorScheme.error) }
+                } else {
+                    IconButton(onClick = { submit() }, enabled = input.isNotBlank() && !state.isRunning) {
+                        Icon(Icons.Filled.Send, "Run", tint = MaterialTheme.colorScheme.primary)
+                    }
                 }
             }
         }
@@ -315,36 +574,74 @@ fun GitConsoleScreen(repoId: Long, onBack: () -> Unit, vm: GitConsoleViewModel =
         )
     }
 
+    state.pendingCloud?.let { pending ->
+        AlertDialog(
+            onDismissRequest = vm::dismissCloud,
+            title = { Text("Run in the cloud?") },
+            text = {
+                Column(Modifier.fillMaxWidth()) {
+                    if (pending.reason != null) {
+                        Text(pending.reason, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(6.dp))
+                    }
+                    Text(
+                        pending.command,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.gitColors.added,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(pending.warning, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            confirmButton = { TextButton(onClick = { vm.confirmCloud(always = false) }) { Text("Run in cloud") } },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { vm.confirmCloud(always = true) }) { Text("Always") }
+                    TextButton(onClick = vm::dismissCloud) { Text("Cancel") }
+                }
+            },
+        )
+    }
+
     if (showHelp) {
         AlertDialog(
             onDismissRequest = { showHelp = false },
-            title = { Text("What's supported") },
+            title = { Text("What can I type?") },
             text = {
-                Column(Modifier.fillMaxWidth()) {
-                    Text(
-                        "This runs commands against the same engine every other screen in the app uses \u2014 there's no real `git` binary bundled, so this covers the common day-to-day subset, not every possible flag.",
-                        style = MaterialTheme.typography.bodySmall,
+                Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                    HelpSection(
+                        "Just type",
+                        "One prompt for everything - no modes to pick. Git commands run on the app's git engine; anything else is tried on the device's own shell, in this repo's folder.",
                     )
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "Supported: status, diff, log, branch, add, restore, rm, mv, commit, push, pull, fetch, switch, checkout, merge, rebase, stash, reset, tag, remote, clean.",
-                        style = MaterialTheme.typography.bodySmall,
+                    HelpSection(
+                        "Git",
+                        "status, diff, log, show, blame, branch, add, restore, rm, mv, commit, push, pull, fetch, switch, checkout, merge, rebase, cherry-pick, stash, reset, tag, remote, clean, reflog, ls-files, config, describe, rev-parse, shortlog, gc. Shortcuts: st, co, br, ci, lg, last, unstage. \"git\" in front is optional.",
                     )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Not supported: config, clone, init, reflog, ls-files, cherry-pick, bisect, submodule. blame opens the File Explorer's own Blame view instead \u2014 it's a richer view than plain text output.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    HelpSection(
+                        "Device shell",
+                        "ls, cat, head, tail, grep, find, sed, wc, sort, cp, mv, rm, mkdir, touch, diff… whatever Android ships. Put ! in front (e.g. !rm notes.txt) to force the shell where a git command has the same name.",
                     )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "reset --hard, clean -f/-fd, push --force, and branch -D always ask for confirmation first.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    HelpSection(
+                        "Cloud",
+                        "A phone can't run cargo, npm, gradle, python… so when you type one, the console offers to run it on a GitHub Actions runner and brings back the output - and any files it changed (like cargo fmt --all). One-time setup: type  cloud setup , then add, commit and push the new file. \"Always\" skips the question next time. Needs a GitHub token with the workflow scope.",
+                    )
+                    HelpSection(
+                        "Careful",
+                        "reset --hard, clean, push --force, branch -D and rm -r always ask first. Stop (✕) cancels a shell or cloud command; a cloud stop also cancels the run on GitHub.",
                     )
                 }
             },
             confirmButton = { TextButton(onClick = { showHelp = false }) { Text("Got it") } },
         )
     }
+}
+
+@Composable
+private fun HelpSection(title: String, body: String) {
+    Text(title, style = MaterialTheme.typography.labelLarge)
+    Text(body, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Spacer(Modifier.height(10.dp))
 }
 
 @Composable
