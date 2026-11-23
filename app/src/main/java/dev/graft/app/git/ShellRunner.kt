@@ -49,12 +49,14 @@ object ShellRunner {
                 coroutineScope {
                     val collected = StringBuilder()
                     val reader = async(Dispatchers.IO) {
-                        process.inputStream.bufferedReader().use { r ->
-                            val buf = CharArray(4096)
-                            while (true) {
-                                val n = r.read(buf)
-                                if (n < 0) break
-                                if (collected.length < MAX_OUTPUT_CHARS) collected.append(buf, 0, n)
+                        runCatching {
+                            process.inputStream.bufferedReader().use { r ->
+                                val buf = CharArray(4096)
+                                while (true) {
+                                    val n = r.read(buf)
+                                    if (n < 0) break
+                                    if (collected.length < MAX_OUTPUT_CHARS) collected.append(buf, 0, n)
+                                }
                             }
                         }
                     }
@@ -64,7 +66,7 @@ object ShellRunner {
                     while (isAlive(process)) {
                         if (System.currentTimeMillis() > deadline) {
                             timedOut = true
-                            process.destroy()
+                            killProcess(process)
                             break
                         }
                         delay(50)
@@ -75,9 +77,16 @@ object ShellRunner {
                 }
             } finally {
                 // Cancelled (Stop pressed / screen gone) or finished: never leave the process behind.
-                if (isAlive(process)) process.destroy()
+                killProcess(process)
             }
         }
+
+    private fun killProcess(process: Process) {
+        if (isAlive(process)) {
+            runCatching { process.destroyForcibly() }.onFailure { process.destroy() }
+        }
+        runCatching { process.inputStream.close() }
+    }
 
     /** `Process.isAlive` needs API 26; the app supports 24. */
     private fun isAlive(process: Process): Boolean =

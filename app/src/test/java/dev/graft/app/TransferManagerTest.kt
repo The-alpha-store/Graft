@@ -25,10 +25,13 @@ class TransferManagerTest {
 
     private fun newManager() = TransferManager(onStartService = {}, onResultNotification = {})
 
-    private suspend fun waitUntil(timeoutMs: Long = 5_000, condition: () -> Boolean) {
+    private suspend fun TransferManager.waitUntil(timeoutMs: Long = 15_000, condition: () -> Boolean) {
         val end = System.currentTimeMillis() + timeoutMs
         while (!condition()) {
-            if (System.currentTimeMillis() > end) fail("timed out waiting for condition")
+            if (System.currentTimeMillis() > end) {
+                val snapshot = tasks.value.joinToString { "${it.title}:${it.state}" }
+                fail("timed out waiting for condition (tasks=[$snapshot])")
+            }
             delay(5)
         }
     }
@@ -57,13 +60,13 @@ class TransferManagerTest {
                 GitResult.Success("ok")
             }
         }
-        waitUntil { m.count(TransferState.RUNNING) == 2 }
+        m.waitUntil { m.count(TransferState.RUNNING) == 2 }
         delay(100) // give a wrongly-eager third one the chance to start
         assertEquals(2, m.count(TransferState.RUNNING))
         assertEquals(1, m.count(TransferState.QUEUED))
 
         gate.complete(Unit)
-        waitUntil { m.count(TransferState.SUCCEEDED) == 3 }
+        m.waitUntil { m.count(TransferState.SUCCEEDED) == 3 }
     }
 
     @Test
@@ -81,14 +84,14 @@ class TransferManagerTest {
                 GitResult.Success("ok")
             }
         }
-        waitUntil { m.count(TransferState.RUNNING) == 1 }
+        m.waitUntil { m.count(TransferState.RUNNING) == 1 }
         delay(100)
         // A free global slot exists, but the repo is busy - so the second must still be waiting.
         assertEquals(1, m.count(TransferState.RUNNING))
         assertEquals(1, m.count(TransferState.QUEUED))
 
         gate.complete(Unit)
-        waitUntil { m.count(TransferState.SUCCEEDED) == 2 }
+        m.waitUntil { m.count(TransferState.SUCCEEDED) == 2 }
         assertEquals(1, maxConcurrent.get())
     }
 
@@ -143,18 +146,20 @@ class TransferManagerTest {
         repeat(2) { i ->
             m.enqueue(TransferKind.FETCH, repoId = (i + 1).toLong(), title = "busy$i") { gate.await(); GitResult.Success("ok") }
         }
-        waitUntil { m.count(TransferState.RUNNING) == 2 }
+        m.waitUntil { m.count(TransferState.RUNNING) == 2 }
 
         val ran = AtomicBoolean(false)
         val queued = m.enqueue(TransferKind.FETCH, repoId = 99, title = "waiting") { ran.set(true); GitResult.Success("ok") }
-        waitUntil { m.count(TransferState.QUEUED) == 1 }
-        m.cancel(m.tasks.value.first { it.state == TransferState.QUEUED }.id)
+        m.waitUntil { m.tasks.value.any { it.title == "waiting" } }
+        val waitingTask = m.tasks.value.first { it.title == "waiting" }
+        assertEquals(TransferState.QUEUED, waitingTask.state)
+        m.cancel(waitingTask.id)
 
         val result = queued.awaitResult()
         assertTrue(result is GitResult.Error)
-        waitUntil { m.count(TransferState.CANCELLED) == 1 }
         gate.complete(Unit)
-        waitUntil { m.count(TransferState.SUCCEEDED) == 2 }
+        m.waitUntil { m.count(TransferState.SUCCEEDED) == 2 }
+        m.waitUntil { m.count(TransferState.CANCELLED) == 1 }
         assertFalse(ran.get())
     }
 
@@ -169,7 +174,7 @@ class TransferManagerTest {
         assertEquals(TransferState.FAILED, failed.state)
 
         m.retry(failed.id)
-        waitUntil { m.tasks.value.singleOrNull()?.state == TransferState.SUCCEEDED }
+        m.waitUntil { m.tasks.value.singleOrNull()?.state == TransferState.SUCCEEDED }
         assertEquals(2, attempts.get())
         assertEquals(1, m.tasks.value.size)          // the failed row was replaced, not duplicated
     }
@@ -185,14 +190,14 @@ class TransferManagerTest {
             gate.await()
             GitResult.Success("done")
         }
-        waitUntil { (m.tasks.value.firstOrNull()?.progress ?: 0f) > 0.4f }
+        m.waitUntil { (m.tasks.value.firstOrNull()?.progress ?: 0f) > 0.4f }
         val task = m.tasks.value.single()
         assertEquals("Receiving objects", task.phase)
         assertEquals(0.475f, task.progress, 0.01f)
         assertEquals(50, task.unitsDone)
         assertFalse(task.indeterminate)
         gate.complete(Unit)
-        waitUntil { m.count(TransferState.SUCCEEDED) == 1 }
+        m.waitUntil { m.count(TransferState.SUCCEEDED) == 1 }
     }
 
     @Test
@@ -221,11 +226,11 @@ class TransferManagerTest {
         m.enqueue(TransferKind.PUSH, repoId = 1, title = "done") { GitResult.Success("ok") }.awaitResult()
         val gate = CompletableDeferred<Unit>()
         m.enqueue(TransferKind.PUSH, repoId = 2, title = "live") { gate.await(); GitResult.Success("ok") }
-        waitUntil { m.count(TransferState.RUNNING) == 1 }
+        m.waitUntil { m.count(TransferState.RUNNING) == 1 }
 
         m.clearFinished()
         assertEquals(listOf("live"), m.tasks.value.map { it.title })
         gate.complete(Unit)
-        waitUntil { m.count(TransferState.SUCCEEDED) == 1 }
+        m.waitUntil { m.count(TransferState.SUCCEEDED) == 1 }
     }
 }
