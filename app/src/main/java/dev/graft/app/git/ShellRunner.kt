@@ -1,6 +1,7 @@
 package dev.graft.app.git
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -15,20 +16,6 @@ data class ShellResult(val exitCode: Int, val output: String, val timedOut: Bool
     val succeeded: Boolean get() = exitCode == 0 && !timedOut
 }
 
-/**
- * Runs a command through the device's own `sh` inside a repo folder.
- *
- * What this *is*: Android ships a real (toybox) userland - `ls cat grep find sed head tail wc sort cp mv rm
- * mkdir touch diff...` - so everyday file inspection and editing from the console genuinely works.
- *
- * What it is *not*: a way to run toolchains. There's no `cargo`, `npm`, `python`, `gradle`... on a stock
- * Android system, and an app can neither borrow Termux's binaries (separate sandbox) nor execute
- * downloaded ones (blocked since Android 10). Those exit 127 here, which the console turns into an offer to
- * run the command in the cloud instead.
- *
- * Cancellation is real: the wait loop polls with a cancellable `delay`, and the `finally` always kills the
- * process, so the Stop button works and nothing is left running if the screen goes away.
- */
 object ShellRunner {
     private const val MAX_OUTPUT_CHARS = 200_000
 
@@ -43,6 +30,11 @@ object ShellRunner {
                 builder.start()
             } catch (e: IOException) {
                 return@withContext ShellResult(127, "sh: couldn't start a shell on this device (${e.message})")
+            }
+
+            // Kill immediately when this coroutine is cancelled, BEFORE coroutineScope waits for children.
+            val cancelHook = coroutineContext[Job]?.invokeOnCompletion { cause ->
+                if (cause != null) killProcess(process)
             }
 
             try {
@@ -76,7 +68,7 @@ object ShellRunner {
                     ShellResult(code, collected.toString().trimEnd(), timedOut)
                 }
             } finally {
-                // Cancelled (Stop pressed / screen gone) or finished: never leave the process behind.
+                cancelHook?.dispose()
                 killProcess(process)
             }
         }
