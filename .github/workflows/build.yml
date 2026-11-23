@@ -1,5 +1,8 @@
 name: Build
 
+# One workflow, two jobs, so a push shows up as a single run:
+#   * check   - unit tests + debug APK on every push / PR (fast feedback on compile errors)
+#   * release - signed release APK + GitHub Release, only for v* tags or a manual dispatch
 on:
   push:
     branches: ["**"]
@@ -21,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # AGP 9 needs Gradle 9.x and JDK 17+. The Gradle version comes from
+      # gradle/wrapper/gradle-wrapper.properties; there is nothing to sync here.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -30,6 +35,8 @@ jobs:
         with:
           gradle-version: wrapper
 
+      # app/build.gradle.kts keeps the AI Studio signing configs untouched, and its debug config
+      # points at <root>/debug.keystore (git-ignored). Generate a throwaway one for CI.
       - name: Create debug keystore
         run: |
           keytool -genkeypair -v -keystore debug.keystore \
@@ -76,6 +83,7 @@ jobs:
         with:
           gradle-version: wrapper
 
+      # The debug config is evaluated for every build, even a release one, so it needs its file too.
       - name: Create debug keystore
         run: |
           keytool -genkeypair -v -keystore debug.keystore \
@@ -83,6 +91,8 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
+      # Secrets: KEYSTORE_B64 (base64 of the .jks/.p12), STORE_PASSWORD, KEY_PASSWORD. The key alias
+      # is fixed to "upload" by the signing config. For a PKCS12 keystore both passwords match.
       - name: Decode release keystore
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
